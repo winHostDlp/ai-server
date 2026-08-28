@@ -131,6 +131,13 @@ Host 인쇄 훅이 없으므로 실제 시연 지원 대상이 아닙니다.
 다음 조건이 모두 같은 실행에서 확인되어야 실제 AI 기반 시연으로 인정합니다.
 Mock 결과나 샘플 로그 전송만으로는 완료 처리하지 않습니다.
 
+Host의 `demo_preflight.py`와 R009 안전·준비 회귀 테스트는 설정·전제 조건과
+플랫폼 중립 조치 계약을 점검하는 검증입니다. 사전 점검이 통과해도 라이브 v7
+호출과 E2E가 증명되지 않으며, 아래처럼 실제 채널 이벤트의 동일한 `event_id`와
+운영체제·애플리케이션 조치를 확인해야 완료됩니다.
+
+- [ ] Host 사전 점검에서 `SentryUserAgent State=Running`, WebProxy TCP 리스너,
+  Outbound UDP/443 QUIC 차단 규칙과 5개 시나리오가 모두 `PASS`이다
 - [ ] AI 서버 루트 헬스 응답에서 `status=running`을 확인한다
 - [ ] 시연 직전 Host의 실제 `RuleFilter -> PayloadBuilder` 결과로 v7 판정을
   사전 확인한다
@@ -163,9 +170,12 @@ Mock 결과나 샘플 로그 전송만으로는 완료 처리하지 않습니다
 | 연동 원본 값 | 대시보드 로그 값 |
 |---|---|
 | AI 요청 `event_id` | `event_id` |
-| `decision=block` | `action_taken=BLOCKED` |
+| `decision=block` + Host 실제 차단 성공 | `action_taken=BLOCKED` |
+| USB 삭제 직전·도중 파일 없음, 파일 지문 변경, 삭제 실패·매체 이탈 | `action_taken=WARNED` + 실패 사유 |
+| WebProxy HTTP 451 응답 생성 실패 | `action_taken=WARNED` + 실패 사유 |
 | `decision=review` | `action_taken=WARNED` |
-| `decision=allow` | `action_taken=ALLOWED` |
+| `decision=allow` + 실제 허용 조치 성공 | `action_taken=ALLOWED` |
+| Clipboard 대상 변경·재발행 실패 | `action_taken=WARNED` + 실패 사유 |
 | `confidence_score` | `ai_score` |
 | AI 요청 `matched_patterns`의 패턴 ID | `matched_keywords` |
 | AI 응답 `reason` | `evidence_summary` |
@@ -190,10 +200,14 @@ Mock 결과나 샘플 로그 전송만으로는 완료 처리하지 않습니다
 
 | 상황 | Host Agent 최종 조치 | 대시보드 기록 |
 |---|---|---|
-| `decision=block` | 차단 | `BLOCKED` |
+| `decision=block` + 실제 조치 성공 | 차단 | `BLOCKED` |
+| USB 삭제 직전·도중 파일 없음, 파일 지문 변경, 삭제 실패·매체 이탈 | 경고, 실제 차단 미확인 | `WARNED` + 실패 사유 |
+| WebProxy HTTP 451 응답 생성 실패 | 경고, 실제 차단 미확인 | `WARNED` + 실패 사유 |
 | `decision=review` | 사용자에게 경고하고 전송/붙여넣기 허용 | `WARNED` |
-| `decision=allow` | 허용 | `ALLOWED` |
-| AI 타임아웃·통신 오류·5xx·잘못된 응답 | Fail-Open으로 허용 | `ALLOWED` + `decision_reason`에 실패 사유 |
+| `decision=allow` + 실제 허용 조치 성공 | 허용 | `ALLOWED` |
+| Clipboard 대상 변경·재발행 실패 | 붙여넣기 미수행 | `WARNED` + 실패 사유 |
+| AI 타임아웃·통신 오류·5xx·잘못된 응답 + 실제 허용 조치 성공 | Fail-Open으로 허용 | `ALLOWED` + `decision_reason`에 실패 사유 |
+| 위 Fail-Open 뒤 Clipboard 대상 변경·재발행 실패 | 붙여넣기 미수행 | `WARNED` + AI 실패·재발행 실패 사유 |
 
 > 아래의 **구현 확인**은 코드에 반영된 계약만 표시합니다. **실행 검증**은 세 저장소를 동시에 실행해야 하므로 성공할 때까지 체크하지 않습니다.
 
@@ -204,12 +218,13 @@ Mock 결과나 샘플 로그 전송만으로는 완료 처리하지 않습니다
 - [x] 대시보드 전송 경로를 `/api/v1/events`가 아닌 `POST /api/v1/logs`로 맞춘다
 - [x] Host Agent가 `clipboard` / `drive_upload`를 `CLIPBOARD` / `CLOUD_DRIVE`로 변환해 전송한다
 - [x] Host Agent가 `model_version`을 대시보드 로그 페이로드에 포함한다
-- [x] 대시보드가 `CLIPBOARD`, `CLOUD_DRIVE`를 허용하고 `model_version`을 저장·조회·표시한다 (Web R009 테스트 44건 통과)
+- [x] 대시보드가 `CLIPBOARD`, `CLOUD_DRIVE`를 허용하고 `model_version`을 저장·조회·표시한다 (Web R009 테스트 45건 통과)
+- [x] Web R009가 로그를 생성하지 않는 보호 API에서 `X-Agent-Token` 일치를 확인하고, Host 사전 점검이 이 결과를 5개 시나리오 준비 조건으로 사용한다
 - [x] Web 분석 중계가 Host Agent의 7개 채널(`clipboard`, `outlook`, `smtp`, `http`, `web_mail`, `drive_upload`, `file_guard`)을 수락하고 `reason`, `evidence_summary`를 반환한다
 - [x] Web 분석 중계가 upstream `event_id` 불일치와 `model_version` 누락을 HTTP 502로 거절한다
-- [x] Host Agent가 정상 `allow`를 모든 채널에서 `ALLOWED`로 기록한다
+- [x] Host Agent가 정상 `allow`의 실제 허용 조치가 성공하면 `ALLOWED`로 기록하고, Clipboard 재발행 실패는 `WARNED`와 실패 사유로 기록한다
 - [x] Host Agent가 모든 `review` 채널에서 사용자에게 경고한 후 허용하고 `WARNED`로 기록한다
-- [x] Host Agent가 AI 타임아웃·통신 오류·5xx와 `decision` / `confidence_score` 누락·형식·범위 오류를 Fail-Open으로 처리하고 `ALLOWED`와 실패 사유를 기록한다 (Host Agent 계약 테스트 81건 통과)
+- [x] Host Agent가 AI 타임아웃·통신 오류·5xx와 `decision` / `confidence_score` 누락·형식·범위 오류를 Fail-Open으로 처리하고 `ALLOWED`와 실패 사유를 기록한다 (Host Agent 기존 통합 계약 테스트 81건 통과)
 - [x] Clipboard의 플랫폼 중립 worker 계약에서 `CF_HDROP` 파일 페이로드에 필요한 형식 분기, 복원·재붙여넣기 호출 순서, 예외 시 release 호출을 검증한다 (실제 Win32 훅 호출 검증 아님)
 - [x] Outlook `ItemSend` 콜백이 판정별 `Cancel` 값을 반환하는 단위 계약을 검증한다
 - [x] 대시보드 flush가 HTTP 성공 응답을 받은 건수만 성공으로 집계한다
@@ -219,7 +234,9 @@ Mock 결과나 샘플 로그 전송만으로는 완료 처리하지 않습니다
   `http://<WEB_LAN_IP>:8000` 또는 팀에서 정한 서버 주소로 설정한다
 - [x] Host Agent가 로그 전송 시 `X-Agent-Token`을 포함할 수 있고 대시보드 로그 요청 스키마를 사용한다
 
-> 교차 저장소 9건은 페이로드를 함수·API 코드에 직접 적용한 계약 검증이며, 실제 서비스 프로세스·네트워크·Windows 채널을 연결한 E2E 테스트가 아닙니다.
+> 교차 저장소 9건은 과거 통합 검토에서 페이로드를 함수·API 코드에 직접 적용한 **수동 계약 검증**입니다. 현재 저장소에서 다시 실행할 수 있는 자동 테스트 파일은 아니며, 실제 서비스 프로세스·네트워크·Windows 채널을 연결한 E2E 테스트도 아닙니다.
+
+> Host 전체 자동 테스트 118건은 **기존 통합 계약 81건 + R009 안전·준비 회귀 37건**입니다. 추가된 37건은 machine-local 드라이브 baseline, 실행 중인 예약 작업·프록시·QUIC 사전 점검, Outlook 원문·Exchange 주소 전달, Clipboard 목적지·조치 결과, WebProxy 파일명·HTTP 차단 결과 분기, USB 안정화·파일 지문·삭제 결과, 대시보드 전송 재시도·수동 재전송 같은 플랫폼 중립 계약을 검증하며 실제 Windows 채널·라이브 v7·Web E2E를 의미하지 않습니다.
 
 ### 로그 수집 API 검증
 
@@ -283,8 +300,8 @@ Mock 결과나 샘플 로그 전송만으로는 완료 처리하지 않습니다
 - [x] `decision=review`를 경고 후 허용하고 `WARNED`로 기록하는 정책을 검토안에 반영 — 전체 담당
 - [x] AI 장애 시 Fail-Open으로 허용하고 실패 사유를 기록하는 정책을 검토안에 반영 — 전체 담당
 - [x] AI `model_version`을 대시보드에 저장·표시하는 계약을 검토안에 반영 — AI Model 담당·Web 담당
-- [x] Host Agent에 채널 변환·`model_version` 전송·모든 판정 로깅·경고·엄격한 Fail-Open·worker/Outlook 단위 계약·조치 결과 보존·flush 집계를 반영하고 계약 테스트 81건을 통과시킨다 — Host Agent 담당
-- [x] 대시보드에 신규 채널·`model_version` 저장/조회/표시·7채널 분석 중계·upstream 응답 검증·다중 시나리오 자동 갱신을 반영하고 Web R009 테스트 44건을 통과시킨다 — Web 담당
+- [x] Host Agent에 채널 변환·`model_version` 전송·판정과 실제 조치 결과 로깅·경고·엄격한 Fail-Open·worker/Outlook/USB/WebProxy 단위 계약·실시간 전송 재시도·수동 flush를 반영하고, 기존 통합 계약 81건과 R009 안전·준비 회귀 37건으로 Host 전체 118건을 통과시킨다 — Host Agent 담당
+- [x] 대시보드에 신규 채널·`model_version` 저장/조회/표시·7채널 분석 중계·보호된 Agent 인증 점검·upstream 응답 검증·다중 시나리오 자동 갱신을 반영하고 Web R009 테스트 45건을 통과시킨다 — Web 담당
 - [ ] 실제 `koelectra-dlp-v7` 서버 URL과 모델을 준비하고 예상 판정을 확인한다 — AI Model 담당
 - [ ] AI 서버·Host Agent·대시보드를 동시 실행하여 위 실행 검증 체크리스트를 완료한다 — 전체
 

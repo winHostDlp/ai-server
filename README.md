@@ -20,7 +20,7 @@ Content-Type: application/json
 | `event_id` | string | O | Host Agent가 발급하는 이벤트 고유 ID |
 | `channel` | string | O | `clipboard` / `outlook` / `http` / `usb` 등 반출 채널 |
 | `user_id` | string | O | 사용자/디바이스 식별자 |
-| `matched_patterns` | string[] | X | 1차 Rule 필터에서 매칭된 패턴명 (없으면 빈 배열) |
+| `matched_patterns` | string[] | X | 1차 Rule 필터에서 매칭된 패턴 ID (없으면 빈 배열) |
 | `snippet` | string | O | 분석할 텍스트 (PII는 사전에 마스킹 권장) |
 | `metadata` | object | X | `app`, `dest`, `severity_hint` 포함 가능 |
 
@@ -68,7 +68,7 @@ Content-Type: application/json
 | confidence_score | decision |
 |---|---|
 | >= 0.41 | block |
-| 0.20 ~ 0.41 | review |
+| 0.20 이상 0.41 미만 | review |
 | < 0.20 | allow |
 
 v7(구어체 보강 재학습) 기준 ROC/PR curve 재검증 결과. 격식체 하드케이스 50건 + 신규 구어체 하드케이스 34건 + 정식 Test셋으로 검증. 모델 재학습 시 threshold도 재산정 필요.
@@ -151,8 +151,17 @@ Host Agent의 실제 채널은 원문에서 설정된 정규식 패턴이 한 �
 ### 라이브 v7 E2E 완료 증거
 
 아래 항목은 실제 장비에서 모두 확인되기 전까지 완료로 표시하지 않습니다.
+Host의 `demo_preflight.py` 통과는 설정과 실행 전제 조건을 점검한 발표 준비도
+증거일 뿐, 라이브 v7 호출이나 E2E 완료 증거가 아닙니다. 실제 채널 이벤트로
+동일한 `event_id`의 전 경로와 운영체제·애플리케이션 조치까지 따로 확인해야 합니다.
+Web R009의 보호 API로 대시보드 토큰 일치까지 확인하지만, 실행 중인 Windows
+훅과 실제 조치 성공 여부를 대신 증명하지는 않습니다. R009 사전 점검은
+`SentryUserAgent` 실행 상태, WebProxy TCP 리스너와 QUIC 차단 규칙도 확인하지만,
+실제 Outlook·USB·Clipboard·브라우저 트래픽 발생 증거는 아닙니다.
 
 - [ ] AI 서버 루트 헬스 응답의 `status`가 `running`이다.
+- [ ] Host 사전 점검에서 `SentryUserAgent`, WebProxy 리스너, QUIC 차단 규칙과
+  5개 시나리오가 모두 `PASS`이다.
 - [ ] 각 AI 응답과 대시보드 상세의 `model_version`이
   `koelectra-dlp-v7`이다.
 - [ ] 각 대시보드 이벤트의 `detection_type`이 `HYBRID`이며 Mock 또는
