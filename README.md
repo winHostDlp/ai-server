@@ -1,6 +1,6 @@
 # Sentry AI 분석 서버 — API 문서
 
-담당: 박동화 (AI 모델 / 판별 서버)
+담당 역할: AI Model 담당
 최종 갱신: 2026-08-13
 모델 버전: `koelectra-dlp-v7`
 

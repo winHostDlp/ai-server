@@ -1,12 +1,18 @@
 # Sentry AI 서버 테스트 시나리오
 
-작성: 박동화 (AI 모델 / 판별 서버)
-목적: Host Agent(김진우) 통합 테스트 시, AI 서버(`/api/v1/analyze`) 단독 검증용 입력값 및 기대 결과 제공
+작성 역할: AI Model 담당
+목적: Host Agent 담당 통합 테스트 시, AI 서버(`/api/v1/analyze`) 단독 검증용 입력값 및 기대 결과 제공
+
+**현재 기준 (2026-08-27)**
+
+- AI 모델: `koelectra-dlp-v7`
+- 판정 기준: `block >= 0.41`, `0.20 <= review < 0.41`, `allow < 0.20`
+- 통합 계약: `review`는 경고 후 허용하고 `WARNED`로 기록하며, AI 장애나 의미적으로 잘못된 응답은 Fail-Open으로 허용하고 실패 사유를 남긴다.
 
 착수보고서 1.3절의 3가지 반출 시나리오를 기준으로, 각 채널별로 block / review / allow가
 모두 나오는 예시를 준비했습니다.
 
-> 대시보드(`/api/v1/logs`) 로그 연동 및 표시 검증은 아래 **웹 대시보드 연동 체크리스트 (이상호)** 절을 참고합니다.
+> 대시보드(`/api/v1/logs`) 로그 연동 및 표시 검증은 아래 **웹 대시보드 연동 체크리스트 (Web 담당)** 절을 참고합니다.
 
 ---
 
@@ -47,7 +53,19 @@
 - [ ] AI 서버가 위 표의 기대 `decision`과 일치하는 응답을 반환한다
 - [ ] `confidence_score`, `model_version`, `latency_ms` 필드가 정상적으로 채워져 있다
 
-## 웹 대시보드 연동 체크리스트 (이상호)
+## 저장소 구현 기준
+
+2026-08-27에 가장 최근 `origin/main`을 반영한 시점의 출발점은 다음과 같습니다.
+
+| 저장소 | `origin/main` | 원격 코드 기준 상태 |
+|---|---|---|
+| `ai-server` | `5d536b4` | v7 API, `0.41` / `0.20` 임계값, 요청 로그 구현. 실제 v7 모델 파일과 실행 평가 결과는 원격에 없어 라이브 재검증 필요 |
+| `host-agent` | `e1c8ca1` | 최신 AI 요청·응답 스키마, `/api/v1/logs`, `X-Agent-Token` 지원. 신규 채널·`model_version`·정책 통일은 이번 통합 작업 대상 |
+| `web` | `0ce3fa3` | 로그 수집 API와 대시보드 구현. `CLIPBOARD`, `CLOUD_DRIVE`, `model_version`은 이번 통합 작업 대상 |
+
+> 아래 **코드 계약 구현 및 자동 검증**은 위 원격 출발점에 현재 통합 작업본과 자동 테스트 결과를 더한 상태입니다. 실제 Windows·AI·대시보드 연동 검증과는 구분합니다.
+
+## 웹 대시보드 연동 체크리스트 (Web 담당)
 
 ### 판정 및 채널 변환 기준
 
@@ -65,41 +83,68 @@
 | AI 응답 `reason` | `evidence_summary` |
 | Host Agent의 최종 조치 사유 | `decision_reason` |
 | AI 응답 `latency_ms` | `latency_ms` |
+| AI 응답 `model_version` | `model_version` (저장 및 상세 화면 표시) |
 
-대시보드 API 기준 채널 변환안은 다음과 같습니다.
+확정된 대시보드 API 채널 변환은 다음과 같습니다.
 
 | AI 요청 `channel` | 대시보드 `leak_channel` |
 |---|---|
 | `http` | `WEB_UPLOAD` |
+| `web_mail` | `WEB_UPLOAD` |
 | `outlook` | `EMAIL_ATTACHMENT` |
+| `smtp` | `EMAIL_ATTACHMENT` |
 | `usb` | `USB_COPY` |
-| `clipboard` | 미확정 — 현재 로그 API 허용값에 `CLIPBOARD`가 없어 팀 합의 필요 |
+| `file_guard` | `USB_COPY` |
+| `clipboard` | `CLIPBOARD` |
+| `drive_upload` | `CLOUD_DRIVE` |
 
-> 아래 항목은 현재 통합 완료 사실이 아니라 세 저장소 연동 시 충족해야 할 검증 기준입니다.
-> 현재 Host Agent의 `request_id` / `risk_score` / `action` 스키마와 대시보드 전송 경로는
-> 최신 AI·대시보드 API 계약에 맞게 정리해야 합니다.
+### 확정된 처리 정책
 
-### 통합 전 API 계약 확인
+| 상황 | Host Agent 최종 조치 | 대시보드 기록 |
+|---|---|---|
+| `decision=block` | 차단 | `BLOCKED` |
+| `decision=review` | 사용자에게 경고하고 전송/붙여넣기 허용 | `WARNED` |
+| `decision=allow` | 허용 | `ALLOWED` |
+| AI 타임아웃·통신 오류·5xx·잘못된 응답 | Fail-Open으로 허용 | `ALLOWED` + `decision_reason`에 실패 사유 |
 
-- [ ] Host Agent의 AI 요청 필드를 `event_id`, `channel`, `user_id`, `matched_patterns`, `snippet`, `metadata` 형식에 맞춘다
-- [ ] Host Agent의 AI 응답 파서를 `decision`, `confidence_score`, `model_version`, `latency_ms`, `reason` 형식에 맞춘다
-- [ ] 대시보드 전송 경로를 `/api/v1/events`가 아닌 `POST /api/v1/logs`로 맞춘다
+> 아래의 **구현 확인**은 코드에 반영된 계약만 표시합니다. **실행 검증**은 세 저장소를 동시에 실행해야 하므로 성공할 때까지 체크하지 않습니다.
+
+### 코드 계약 구현 및 자동 검증
+
+- [x] Host Agent의 AI 요청 필드를 `event_id`, `channel`, `user_id`, `matched_patterns`, `snippet`, `metadata` 형식에 맞춘다
+- [x] Host Agent의 AI 응답 파서를 `decision`, `confidence_score`, `model_version`, `latency_ms`, `reason` 형식에 맞춘다
+- [x] 대시보드 전송 경로를 `/api/v1/events`가 아닌 `POST /api/v1/logs`로 맞춘다
+- [x] Host Agent가 `clipboard` / `drive_upload`를 `CLIPBOARD` / `CLOUD_DRIVE`로 변환해 전송한다
+- [x] Host Agent가 `model_version`을 대시보드 로그 페이로드에 포함한다
+- [x] 대시보드가 `CLIPBOARD`, `CLOUD_DRIVE`를 허용하고 `model_version`을 저장·조회·표시한다 (Web 테스트 37건 통과)
+- [x] Web 분석 중계가 Host Agent의 7개 채널(`clipboard`, `outlook`, `smtp`, `http`, `web_mail`, `drive_upload`, `file_guard`)을 수락하고 `reason`, `evidence_summary`를 반환한다
+- [x] Web 분석 중계가 upstream `event_id` 불일치와 `model_version` 누락을 HTTP 502로 거절한다
+- [x] Host Agent가 정상 `allow`를 모든 채널에서 `ALLOWED`로 기록한다
+- [x] Host Agent가 모든 `review` 채널에서 사용자에게 경고한 후 허용하고 `WARNED`로 기록한다
+- [x] Host Agent가 AI 타임아웃·통신 오류·5xx와 `decision` / `confidence_score` 누락·형식·범위 오류를 Fail-Open으로 처리하고 `ALLOWED`와 실패 사유를 기록한다 (Host Agent 계약 테스트 81건 통과)
+- [x] Clipboard의 플랫폼 중립 worker 계약에서 `CF_HDROP` 파일 페이로드에 필요한 형식 분기, 복원·재붙여넣기 호출 순서, 예외 시 release 호출을 검증한다 (실제 Win32 훅 호출 검증 아님)
+- [x] Outlook `ItemSend` 콜백이 판정별 `Cancel` 값을 반환하는 단위 계약을 검증한다
+- [x] 대시보드 flush가 HTTP 성공 응답을 받은 건수만 성공으로 집계한다
+- [x] `EventLogger`·`Notifier` 실패를 조치 로직과 격리해 `block` / `review` / `allow`를 바꾸지 않고, Web 차단 HTTP 451·Clipboard 차단·USB·SMTP·HTTP·Outlook의 판정별 조치를 보존한다
+- [x] 교차 저장소 코드 계약 검증으로 7개 채널의 analyze 페이로드 7건과 로그 페이로드 2건을 Host→Web 코드에 직접 적용해 통과시킨다
 - [ ] 로컬 통합 테스트 시 대시보드 주소를 `http://127.0.0.1:8000` 또는 팀에서 정한 주소로 설정한다
-- [ ] 로그 전송 시 `X-Agent-Token`을 포함하고 대시보드의 로그 요청 스키마를 사용한다
+- [x] Host Agent가 로그 전송 시 `X-Agent-Token`을 포함할 수 있고 대시보드 로그 요청 스키마를 사용한다
+
+> 교차 저장소 9건은 페이로드를 함수·API 코드에 직접 적용한 계약 검증이며, 실제 서비스 프로세스·네트워크·Windows 채널을 연결한 E2E 테스트가 아닙니다.
 
 ### 로그 수집 API 검증
 
 - [ ] AI 분석 요청과 로그 저장 요청에 동일한 `event_id`가 사용된다
 - [ ] Host Agent가 `X-Agent-Token` 헤더를 포함해 `POST /api/v1/logs`를 호출한다
 - [ ] 최초 전송 시 HTTP 201과 `duplicate=false`가 반환된다
-- [ ] `ai_score`, `action_taken`, `leak_channel`, `matched_keywords`, `evidence_summary`, `latency_ms`가 Agent 전송값과 동일하게 저장된다
+- [ ] `ai_score`, `action_taken`, `leak_channel`, `matched_keywords`, `evidence_summary`, `latency_ms`, `model_version`이 Agent 전송값과 동일하게 저장된다
 - [ ] 동일한 `event_id`를 재전송하면 HTTP 200과 `duplicate=true`가 반환되고 로그가 중복 생성되지 않는다
 
 ### 로그 및 대시보드 화면 검증
 
 - [ ] `GET /api/v1/logs` 목록에서 신규 이벤트를 `event_id`로 확인할 수 있다
-- [ ] `GET /api/v1/logs/{log_id}` 상세 응답에 사용자·Host·파일·프로세스·정책·탐지 근거가 표시된다
-- [ ] `/logs` 화면에서 `BLOCKED` / `WARNED` / `ALLOWED` 상태, AI 점수, 매칭 키워드와 판단 사유가 정상 표시된다
+- [ ] `GET /api/v1/logs/{log_id}` 상세 응답에 사용자·Host·파일·프로세스·정책·탐지 근거·`model_version`이 포함된다
+- [ ] `/logs` 화면에서 `BLOCKED` / `WARNED` / `ALLOWED` 상태, AI 점수, 모델 버전, 매칭 키워드와 판단 사유가 정상 표시된다
 - [ ] 부서, 사용자, Agent, 조치 결과, 반출 채널, 날짜 및 검색어 필터가 신규 이벤트에 적용된다
 - [ ] `GET /api/v1/dashboard/summary?days=7`의 KPI와 타임라인에 신규 이벤트가 1건 반영된다
 - [ ] 차단 이벤트는 채널 분포·부서 통계·고위험 이벤트 목록에 반영된다
@@ -111,23 +156,38 @@
 - [ ] 존재하지 않는 `log_id` 상세 조회는 HTTP 404를 반환한다
 - [ ] AI 서버 장애로 Host Agent가 Fail-Open 처리한 이벤트도 `ALLOWED`와 장애 사유를 포함해 로그로 남는지 확인한다
 
+### Windows 실환경 채널 검증
+
+> 아래 항목은 단위 계약 테스트와 달리 Windows API·권한·Office COM이 필요한 실행 검증입니다.
+
+- [ ] Windows Explorer에서 복수 파일 `CF_HDROP` 붙여넣기를 `allow` / `review`했을 때 원본 파일 목록과 형식이 보존되는지 확인한다
+- [ ] 일반 프로세스와 관리자 권한 프로세스에서 `SendInput` 재붙여넣기를 확인하고 UIPI 제약과 실패 시 동작을 기록한다
+- [ ] 실제 Outlook COM `ItemSend`에서 `block`은 `Cancel=True`, `review` / `allow`는 `Cancel=False`로 적용되는지 확인한다
+- [ ] AI 서버·Windows Host Agent·대시보드를 동시 실행해 전체 이벤트 흐름을 E2E로 확인한다
+
 ## 장애 상황 테스트 (Fail-Open 정책 확인용)
 
-> 현재 Host Agent는 AI 서버 타임아웃·오류 시 `block`을 반환하므로, 아래 Fail-Open 목표 정책과
-> 일치시키려면 Host Agent의 오류 처리 로직 변경이 필요합니다.
+> 타임아웃·통신 오류·AI 5xx·의미적으로 잘못된 응답을 각각 재현해, 사용자 작업은 허용되고 동일한 `event_id`의 장애 로그가 남는지 확인합니다.
 
 - [ ] AI 서버가 응답하지 않을 때(타임아웃) Host Agent가 기본 허용(Fail-Open)으로 동작하는지 확인
-- [ ] AI 서버가 500 에러를 반환할 때도 Host Agent가 정상적으로 처리(차단 없이 통과)하는지 확인
+- [ ] AI 서버가 500 에러를 반환할 때도 Host Agent가 차단 없이 통과시키는지 확인
+- [ ] `decision` / `confidence_score`가 누락되거나 알 수 없는 값·비수치·`NaN`·범위 밖일 때 차단 없이 통과시키는지 확인
+- [ ] 위 장애 이벤트가 `action_taken=ALLOWED`와 구체적인 `decision_reason`을 포함해 대시보드에 저장되는지 확인
 
 ---
 
-## TODO (다른 파트와 합쳐서 보완 필요)
+## TODO 및 담당
 
-- [x] 대시보드(`/api/v1/logs`) 로그 기록 및 상세 화면 표시 체크리스트 작성 — 이상호 파트
-- [ ] `channel=clipboard`를 대시보드 `leak_channel`에 저장하는 방식 확정 — 김진우·이상호 파트, 팀 합의 필요
-- [ ] `decision=review` 정책 최종 확정 — 현재 Host Agent는 허용 후 `review` 기록, 팀 합의 필요
-- [ ] AI `model_version`을 대시보드 로그에 저장할지 확정 — 박동화·이상호 파트, 팀 합의 필요
+- [x] 대시보드(`/api/v1/logs`) 로그 기록 및 상세 화면 표시 체크리스트 작성 — Web 담당
+- [x] `clipboard -> CLIPBOARD`, `drive_upload -> CLOUD_DRIVE` 채널 계약 확정 — Host Agent 담당·Web 담당
+- [x] `decision=review`를 경고 후 허용하고 `WARNED`로 기록하는 정책 확정 — 전체
+- [x] AI 장애 시 Fail-Open으로 허용하고 실패 사유를 기록하는 정책 확정 — 전체
+- [x] AI `model_version`을 대시보드에 저장·표시하도록 계약 확정 — AI Model 담당·Web 담당
+- [x] Host Agent에 채널 변환·`model_version` 전송·모든 판정 로깅·경고·엄격한 Fail-Open·worker/Outlook 단위 계약·조치 결과 보존·flush 집계를 반영하고 계약 테스트 81건을 통과시킨다 — Host Agent 담당
+- [x] 대시보드에 신규 채널·`model_version` 저장/조회/표시·7채널 분석 중계·upstream 응답 검증을 반영하고 Web 테스트 37건을 통과시킨다 — Web 담당
+- [ ] 실제 `koelectra-dlp-v7` 서버 URL과 모델을 준비하고 예상 판정을 확인한다 — AI Model 담당
+- [ ] AI 서버·Host Agent·대시보드를 동시 실행하여 위 실행 검증 체크리스트를 완료한다 — 전체
 
-> 참고: 위 텍스트들은 AI 서버 재학습 시 사용된 검증 데이터(train_dataset_v5.csv, hard_test_set_v1.csv)에서
-> 대표성 있는 케이스를 발췌한 것입니다. 실제 confidence_score 수치는 서버 버전에 따라 소수점 단위로
-> 달라질 수 있으나, decision(block/review/allow) 결과는 위와 동일하게 나와야 합니다.
+> 참고: v7은 `data/train_dataset_v6.csv`(223건, 구어체 40건 보강)로 재학습했습니다. 위 텍스트는
+> `data/train_dataset_v5.csv`와 `data/hard_test_set_v1.csv`의 대표 케이스입니다. 실제 `confidence_score`는
+> v7 실행 환경에서 재확인하고, 예상 `decision`과 다르면 입력·임계값·모델 버전을 함께 기록합니다.
