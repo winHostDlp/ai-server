@@ -24,6 +24,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
+from model_bundle import ModelBundleError, model_bundle_sha256
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 TRACKED_DATASETS = (
@@ -91,7 +93,7 @@ def validate_lock(value: object) -> dict[str, object]:
     if value.get("model_version") != MODEL_VERSION:
         raise GateError(f"model_version은 {MODEL_VERSION}이어야 합니다.")
 
-    for name in ("checkpoint_sha256", "ood_csv_sha256"):
+    for name in ("checkpoint_sha256", "model_bundle_sha256", "ood_csv_sha256"):
         digest = value.get(name)
         if not isinstance(digest, str) or SHA256_PATTERN.fullmatch(digest) is None:
             raise GateError(f"{name}은 실제 파일의 소문자 SHA-256이어야 합니다.")
@@ -116,6 +118,7 @@ def validate_lock(value: object) -> dict[str, object]:
         "status": "locked",
         "model_version": MODEL_VERSION,
         "checkpoint_sha256": value["checkpoint_sha256"],
+        "model_bundle_sha256": value["model_bundle_sha256"],
         "ood_csv_sha256": value["ood_csv_sha256"],
         "block_threshold": block,
         "review_threshold": review,
@@ -145,6 +148,16 @@ def parse_lock(raw: bytes) -> dict[str, object]:
 def verify_file_hash(path: Path, expected: str, description: str) -> None:
     if sha256_file(path) != expected:
         raise GateError(f"{description} SHA-256이 lock manifest와 다릅니다.")
+
+
+def verify_model_bundle_hash(path: Path, expected: str) -> str:
+    try:
+        actual = model_bundle_sha256(path)
+    except ModelBundleError as exc:
+        raise GateError(str(exc)) from exc
+    if actual != expected:
+        raise GateError("model bundle SHA-256이 lock manifest와 다릅니다.")
+    return actual
 
 
 def normalize_text(text: str) -> str:
@@ -337,12 +350,13 @@ def validate_health(response: dict[str, object], lock: dict[str, object]) -> Non
         response.get("status") != "running"
         or response.get("engine") != lock["model_version"]
         or response.get("checkpoint_sha256") != lock["checkpoint_sha256"]
+        or response.get("model_bundle_sha256") != lock["model_bundle_sha256"]
         or response.get("auth_required") is not True
         or block != lock["block_threshold"]
         or review != lock["review_threshold"]
     ):
         raise ContractError(
-            "live API checkpoint, 모델 버전, 인증 또는 threshold가 lock과 다릅니다."
+            "live API checkpoint/model bundle, 모델 버전, 인증 또는 threshold가 lock과 다릅니다."
         )
 
 
@@ -398,6 +412,33 @@ def compute_metrics(labels: list[int], predictions: list[int]) -> dict[str, obje
     }
 
 
+def compute_group_metrics(
+    rows: list[dict[str, object]],
+    predictions: list[int],
+    fields: tuple[str, ...],
+) -> list[dict[str, object]]:
+    if len(rows) != len(predictions):
+        raise GateError("subgroup metrics 입력 길이가 잘못되었습니다.")
+    groups: dict[tuple[str, ...], tuple[list[int], list[int]]] = {}
+    for row, prediction in zip(rows, predictions):
+        key = tuple(normalize_text(str(row[field])) for field in fields)
+        labels, group_predictions = groups.setdefault(key, ([], []))
+        labels.append(int(row["label"]))
+        group_predictions.append(prediction)
+
+    result = []
+    for key in sorted(groups):
+        labels, group_predictions = groups[key]
+        result.append(
+            {
+                **dict(zip(fields, key)),
+                "count": len(labels),
+                **compute_metrics(labels, group_predictions),
+            }
+        )
+    return result
+
+
 def invalid_outcome(reason: str, completed: int) -> dict[str, object]:
     return {
         "status": "invalid",
@@ -407,6 +448,8 @@ def invalid_outcome(reason: str, completed: int) -> dict[str, object]:
         "contract_errors": int(reason == "contract_error"),
         "quality_passed": None,
         "metrics": None,
+        "metrics_by_domain": None,
+        "metrics_by_domain_style": None,
     }
 
 
@@ -426,6 +469,10 @@ def evaluate_rows(rows, lock, request_case) -> dict[str, object]:
         labels.append(int(row["label"]))
         predictions.append(int(score >= float(lock["block_threshold"])))
     metrics = compute_metrics(labels, predictions)
+    metrics_by_domain = compute_group_metrics(rows, predictions, ("domain",))
+    metrics_by_domain_style = compute_group_metrics(
+        rows, predictions, ("domain", "style")
+    )
     quality_passed = (
         float(metrics["f1"]) >= float(lock["minimum_f1"])
         and float(metrics["recall"]) >= float(lock["minimum_recall"])
@@ -438,6 +485,8 @@ def evaluate_rows(rows, lock, request_case) -> dict[str, object]:
         "contract_errors": 0,
         "quality_passed": quality_passed,
         "metrics": metrics,
+        "metrics_by_domain": metrics_by_domain,
+        "metrics_by_domain_style": metrics_by_domain_style,
     }
 
 
@@ -498,6 +547,9 @@ def run(args: argparse.Namespace) -> int:
     if sha256_bytes(ood_bytes) != lock["ood_csv_sha256"]:
         raise GateError("OOD CSV SHA-256이 lock manifest와 다릅니다.")
     verify_file_hash(checkpoint_path, str(lock["checkpoint_sha256"]), "checkpoint")
+    model_bundle_digest = verify_model_bundle_hash(
+        checkpoint_path.parent, str(lock["model_bundle_sha256"])
+    )
     rows = parse_ood_rows(ood_bytes)
     validate_ood_design(rows, int(lock["expected_rows"]))
     ensure_no_tracked_overlap(rows)
@@ -509,6 +561,7 @@ def run(args: argparse.Namespace) -> int:
         "evaluated_at_utc": datetime.now(timezone.utc).isoformat(),
         "model_version": lock["model_version"],
         "checkpoint_sha256": lock["checkpoint_sha256"],
+        "model_bundle_sha256": model_bundle_digest,
         "ood_csv_sha256": lock["ood_csv_sha256"],
         "lock_manifest_sha256": sha256_bytes(manifest_bytes),
         "block_threshold": lock["block_threshold"],

@@ -221,6 +221,7 @@ def test_model_checkpoint_identity_is_verified_before_serving() -> None:
     assert "model.config.sentry_model_version = MODEL_VERSION" in train
     assert 'model.config.id2label = {0: "non_sensitive", 1: "sensitive"}' in train
     assert '"checkpoint_sha256": CHECKPOINT_SHA256' in server
+    assert '"model_bundle_sha256": MODEL_BUNDLE_SHA256' in server
 
 
 def test_model_checkpoint_weight_file_selection_is_unambiguous(tmp_path: Path) -> None:

@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 import eval_ood_final as gate
+from model_bundle import ModelBundleError, model_bundle_sha256
 
 
 def _digest(value: bytes) -> str:
@@ -20,6 +21,7 @@ def _lock(**overrides) -> dict[str, object]:
         "status": "locked",
         "model_version": gate.MODEL_VERSION,
         "checkpoint_sha256": _digest(b"test checkpoint"),
+        "model_bundle_sha256": _digest(b"test model bundle"),
         "ood_csv_sha256": _digest(b"test ood csv"),
         "block_threshold": 0.41,
         "review_threshold": 0.20,
@@ -66,6 +68,7 @@ def test_example_manifest_is_deliberately_invalid_and_contains_no_fake_hash() ->
     example = json.loads(example_path.read_text(encoding="utf-8"))
 
     assert example["checkpoint_sha256"] == ""
+    assert example["model_bundle_sha256"] == ""
     assert example["ood_csv_sha256"] == ""
     with pytest.raises(gate.GateError):
         gate.validate_lock(example)
@@ -77,6 +80,7 @@ def test_lock_rejects_hash_or_threshold_mismatch() -> None:
 
     for invalid in (
         _lock(checkpoint_sha256=""),
+        _lock(model_bundle_sha256="not-a-hash"),
         _lock(ood_csv_sha256="not-a-hash"),
         _lock(block_threshold=0.20, review_threshold=0.20),
         _lock(block_threshold=True),
@@ -99,6 +103,44 @@ def test_file_hash_mismatch_fails_closed(tmp_path: Path) -> None:
     gate.verify_file_hash(artifact, _digest(b"actual artifact"), "artifact")
     with pytest.raises(gate.GateError, match="SHA-256"):
         gate.verify_file_hash(artifact, _digest(b"different artifact"), "artifact")
+
+
+def test_model_bundle_hash_binds_file_paths_and_bytes(tmp_path: Path) -> None:
+    bundle = tmp_path / "model"
+    bundle.mkdir()
+    config = bundle / "config.json"
+    tokenizer = bundle / "tokenizer.json"
+    config.write_bytes(b'{"labels": 2}')
+    tokenizer.write_bytes(b'{"version": 1}')
+    original = model_bundle_sha256(bundle)
+    assert model_bundle_sha256(bundle) == original
+    assert gate.verify_model_bundle_hash(bundle, original) == original
+    with pytest.raises(gate.GateError, match="model bundle SHA-256"):
+        gate.verify_model_bundle_hash(bundle, _digest(b"other model bundle"))
+
+    tokenizer.write_bytes(b'{"version": 2}')
+    changed_bytes = model_bundle_sha256(bundle)
+    tokenizer.write_bytes(b'{"version": 1}')
+    tokenizer.rename(bundle / "renamed-tokenizer.json")
+    changed_path = model_bundle_sha256(bundle)
+
+    assert original != changed_bytes
+    assert original != changed_path
+
+
+def test_model_bundle_hash_rejects_empty_or_symlinked_entries(tmp_path: Path) -> None:
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(ModelBundleError):
+        model_bundle_sha256(empty)
+
+    bundle = tmp_path / "model"
+    bundle.mkdir()
+    target = bundle / "config.json"
+    target.write_text("{}", encoding="utf-8")
+    (bundle / "config-link.json").symlink_to(target)
+    with pytest.raises(ModelBundleError, match="symlink"):
+        model_bundle_sha256(bundle)
 
 
 def test_ood_csv_requires_exact_schema(tmp_path: Path) -> None:
@@ -214,8 +256,8 @@ def test_metrics_report_binary_confusion_precision_recall_and_f1() -> None:
 def test_complete_evaluation_passes_or_preserves_failed_quality_metrics() -> None:
     lock = gate.validate_lock(_lock())
     rows = [
-        {"case_id": "positive", "label": 1},
-        {"case_id": "negative", "label": 0},
+        {"case_id": "positive", "label": 1, "domain": "hr", "style": "formal"},
+        {"case_id": "negative", "label": 0, "domain": "hr", "style": "formal"},
     ]
 
     def evaluate(scores):
@@ -246,12 +288,66 @@ def test_complete_evaluation_passes_or_preserves_failed_quality_metrics() -> Non
     assert failed["metrics"]["recall"] == 0.0
 
 
+def test_subgroup_metrics_expose_failure_hidden_by_overall_pass() -> None:
+    lock = gate.validate_lock(_lock())
+    rows = [
+        {
+            "case_id": f"large-{label}-{index}",
+            "label": label,
+            "domain": "large",
+            "style": "plain",
+        }
+        for label in (0, 1)
+        for index in range(10)
+    ] + [
+        {
+            "case_id": "small-positive",
+            "label": 1,
+            "domain": "small",
+            "style": "formal",
+        },
+        {
+            "case_id": "small-negative",
+            "label": 0,
+            "domain": "small",
+            "style": "formal",
+        },
+    ]
+
+    def request_case(row, event_id):
+        score = (
+            0.1
+            if row["case_id"] == "small-positive" or row["label"] == 0
+            else 0.9
+        )
+        return {
+            "event_id": event_id,
+            "decision": gate.expected_decision(score, 0.41, 0.20),
+            "confidence_score": score,
+            "model_version": gate.MODEL_VERSION,
+            "latency_ms": 1.0,
+        }
+
+    result = gate.evaluate_rows(rows, lock, request_case)
+
+    assert result["status"] == "passed"
+    assert result["metrics"]["recall"] == 10 / 11
+    assert [item["domain"] for item in result["metrics_by_domain"]] == [
+        "large",
+        "small",
+    ]
+    assert result["metrics_by_domain"][1]["count"] == 2
+    assert result["metrics_by_domain"][1]["recall"] == 0.0
+    assert result["metrics_by_domain_style"][1]["style"] == "formal"
+
+
 def test_live_health_must_match_locked_model_and_thresholds() -> None:
     lock = gate.validate_lock(_lock())
     valid = {
         "status": "running",
         "engine": gate.MODEL_VERSION,
         "checkpoint_sha256": lock["checkpoint_sha256"],
+        "model_bundle_sha256": lock["model_bundle_sha256"],
         "auth_required": True,
         "block_threshold": 0.41,
         "review_threshold": 0.20,
@@ -262,6 +358,7 @@ def test_live_health_must_match_locked_model_and_thresholds() -> None:
         {key: value for key, value in valid.items() if key != "auth_required"},
         {**valid, "engine": "koelectra-dlp-v6"},
         {**valid, "checkpoint_sha256": _digest(b"other checkpoint")},
+        {**valid, "model_bundle_sha256": _digest(b"other model bundle")},
         {**valid, "block_threshold": 0.42},
         {**valid, "auth_required": False},
         {**valid, "auth_required": 1},
@@ -332,6 +429,8 @@ def test_one_transport_error_invalidates_all_metrics() -> None:
     assert result["evaluated_rows"] == 1
     assert result["quality_passed"] is None
     assert result["metrics"] is None
+    assert result["metrics_by_domain"] is None
+    assert result["metrics_by_domain_style"] is None
 
 
 def test_incomplete_http_body_is_a_transport_error(
@@ -381,6 +480,7 @@ def test_api_route_uses_same_locked_bytes_and_reserves_output_first() -> None:
 
     assert 'f"{base_url}/api/v1/analyze"' in source
     assert "sha256_bytes(ood_bytes)" in run_source
+    assert "model_bundle_digest = verify_model_bundle_hash(" in run_source
     assert "parse_ood_rows(ood_bytes)" in run_source
     assert run_source.index("reserve_result(output_path, result)") < run_source.index(
         "request_json(f\"{base_url}/\""

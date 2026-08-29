@@ -18,6 +18,8 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Annotated, Literal, Optional
 
+from model_bundle import model_bundle_sha256
+
 AI_API_TOKEN = os.environ.get("AI_API_TOKEN", "").strip()
 try:
     AI_API_TOKEN_BYTES = AI_API_TOKEN.encode("ascii")
@@ -308,12 +310,14 @@ model_loaded = False
 model = None
 tokenizer = None
 CHECKPOINT_SHA256 = None
+MODEL_BUNDLE_SHA256 = None
 
 try:
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
     model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH).to(DEVICE)
     validate_model_config(model)
     CHECKPOINT_SHA256 = sha256_file(resolve_model_weights(MODEL_PATH))
+    MODEL_BUNDLE_SHA256 = model_bundle_sha256(MODEL_PATH)
     model.eval()
     warmup_inputs = tokenizer(
         "DLP 모델 준비 상태 확인",
@@ -421,6 +425,7 @@ def health_check():
         "block_threshold": BLOCK_THRESHOLD,
         "review_threshold": REVIEW_THRESHOLD,
         "checkpoint_sha256": CHECKPOINT_SHA256,
+        "model_bundle_sha256": MODEL_BUNDLE_SHA256,
         "auth_required": True,
     }
 

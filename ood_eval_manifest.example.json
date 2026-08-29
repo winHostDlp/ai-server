@@ -2,6 +2,7 @@
   "status": "EXAMPLE_NOT_LOCKED",
   "model_version": "koelectra-dlp-v7",
   "checkpoint_sha256": "",
+  "model_bundle_sha256": "",
   "ood_csv_sha256": "",
   "block_threshold": null,
   "review_threshold": null,

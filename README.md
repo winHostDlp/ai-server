@@ -27,9 +27,9 @@ os.environ["AI_API_TOKEN"] = secrets.token_urlsafe(32)
 
 같은 `AI_API_TOKEN`을 Host의 환경변수 또는 Git에서 제외된 `config/settings.local.yaml`의 `server.ai_token`, Web의 `AI_SERVER_TOKEN`에 설정하되 추적 설정·Git·채팅·발표 화면에 값을 남기지 않습니다. Host 환경변수가 local YAML보다 우선합니다.
 
-`server.py`는 **Google Colab의 Linux amd64 런타임 전용**이며, Colab 셀 붙여넣기와 그 런타임 안의 `python server.py` 실행을 지원합니다. macOS·Windows·ARM·일반 로컬 Python 실행 지원을 뜻하지 않습니다. 독립 실행은 `Ctrl+C`까지 유지되고, Colab에서 셀을 다시 실행할 때는 그 셀이 앞서 만든 서버·터널만 종료합니다. 터널이 예기치 않게 종료되면 연결이 끊긴 로컬 API도 중단하며, 다른 `cloudflared` 프로세스는 광역 종료하지 않습니다. 내려받는 `cloudflared`는 `2026.8.2` Linux amd64와 공식 SHA-256으로 고정·검증하며, 다운로드가 60초 동안 응답하지 않으면 중단합니다. FastAPI·Uvicorn·Pydantic·PyTorch·Transformers는 코드가 전제한 호환 메이저 범위로 설치해 기존 Pydantic v1 환경을 그대로 사용하지 않습니다.
+`server.py`는 **Google Colab의 Linux amd64 런타임 전용**이며, 같은 디렉터리에 `model_bundle.py`를 둔 상태에서 그 런타임의 `python server.py` 또는 `%run server.py`로 실행합니다. 모델 번들 검증을 우회할 수 있는 `server.py` 단독 셀 붙여넣기는 더 이상 지원하지 않으며 helper가 없으면 import 단계에서 실패합니다. macOS·Windows·ARM·일반 로컬 Python 실행 지원을 뜻하지 않습니다. 독립 실행은 `Ctrl+C`까지 유지되고, Colab에서 셀을 다시 실행할 때는 그 셀이 앞서 만든 서버·터널만 종료합니다. 터널이 예기치 않게 종료되면 연결이 끊긴 로컬 API도 중단하며, 다른 `cloudflared` 프로세스는 광역 종료하지 않습니다. 내려받는 `cloudflared`는 `2026.8.2` Linux amd64와 공식 SHA-256으로 고정·검증하며, 다운로드가 60초 동안 응답하지 않으면 중단합니다. FastAPI·Uvicorn·Pydantic·PyTorch·Transformers는 코드가 전제한 호환 메이저 범위로 설치해 기존 Pydantic v1 환경을 그대로 사용하지 않습니다.
 
-서버는 체크포인트의 `sentry_model_version`, 2-label 구성, `label 1 = sensitive` 매핑과 준비 추론을 모두 확인한 뒤에만 `status=running`을 반환합니다. 기존 Drive 체크포인트에 이 메타데이터가 없다면 이름만 보고 v7로 간주하지 않고 분석 준비를 거절하므로, 현재 `train_koelectra_v7.py`로 재학습한 `final` 체크포인트를 사용해야 합니다.
+서버는 체크포인트의 `sentry_model_version`, 2-label 구성, `label 1 = sensitive` 매핑, weights SHA-256, tokenizer/config를 포함한 전체 모델 번들 SHA-256과 준비 추론을 모두 확인한 뒤에만 `status=running`을 반환합니다. 기존 Drive 체크포인트에 이 메타데이터가 없다면 이름만 보고 v7로 간주하지 않고 분석 준비를 거절하므로, 현재 `train_koelectra_v7.py`로 재학습한 `final` 체크포인트를 사용해야 합니다.
 
 ## 2. Request
 
@@ -146,14 +146,16 @@ os.environ["AI_BASE_URL"] = "https://<현재-주소>.trycloudflare.com"
 1. 학습·Validation·hard-case 분석을 마치고 사용할 v7 checkpoint와
    `block_threshold` / `review_threshold`를 먼저 동결합니다.
 2. 서버 실행 전에 `SENTRY_MODEL_PATH`를 명시합니다. 평가 담당자가 저장소 밖에
-   보관한 OOD CSV와 그 경로의 실제 weights 파일 SHA-256을 계산해 외부 lock
-   manifest에 기록합니다. OOD 실제 행 수를 `expected_rows`에 고정하고
+   보관한 OOD CSV, 그 경로의 실제 weights 파일 SHA-256, 전체 모델 디렉터리의
+   `model_bundle_sha256`을 계산해 외부 lock manifest에 기록합니다. OOD 실제 행 수를
+   `expected_rows`에 고정하고
    품질 합격선 `minimum_f1` / `minimum_recall`도 결과를 보기 전에 고정한 뒤
    `status`를 `locked`로 바꿉니다. F1 90% 이상·Recall 우선 목표가 무력화되지
    않도록 두 합격선 모두 0.90 이상 1 이하만 허용합니다.
 3. 같은 Colab 런타임에서 라이브 서버를 연 뒤 아래 명령을 한 번 실행합니다.
-4. 생성된 aggregate JSON의 SHA-256과 precision/recall/F1/confusion을
-   공개합니다. OOD 원문·행별 예측은 공개하지 않습니다.
+4. 생성된 aggregate JSON의 SHA-256과 전체·domain·domain×style별
+   precision/recall/F1/confusion을 공개합니다. OOD 원문·case ID·행별 예측은
+   공개하지 않습니다.
 5. 결과를 본 뒤 checkpoint, threshold, 데이터 또는 전처리를 다시 고르지
    않습니다. 바꾸면 기존 OOD는 튜닝 데이터가 된 것이므로 새 독립 OOD로
    처음부터 다시 평가해야 합니다.
@@ -169,6 +171,9 @@ manifest의 `expected_rows`와 정확히 일치해야 합니다.
 `hard_test_set_v1.csv`의 정규화 exact-overlap도 네트워크 호출 전에 거절합니다.
 현재 gate가 보장하는 범위는 저장소 밖에 고정된 blind OOD, label 균형,
 domain/style 내부 구성 조건, 추적 train/hard 데이터와의 exact text-overlap 차단까지입니다.
+전체 합격 판정은 잠근 전체 F1/Recall 기준만 사용하고, 정렬된 domain 및
+domain×style 지표는 특정 하위 그룹의 실패가 전체 수치에 가려지지 않도록 보고만
+합니다. 하위 그룹별 합격선을 추가하려면 먼저 그룹별 최소 표본 수를 합의해야 합니다.
 CSV에 적힌 domain/style만으로 truly held-out domain/style을 증명하지는 않습니다.
 그 주장을 하려면 평가 전에 domain/style 목록을 고정하고, 학습 데이터의 domain 목록과
 불교집합임을 확인할 수 있는 근거를 별도로 추가해야 합니다.
@@ -184,17 +189,21 @@ python eval_ood_final.py \
 ```
 
 `--checkpoint-file`은 실행 중인 서버의 `SENTRY_MODEL_PATH`가 실제로 읽은 weights
-파일을 가리켜야 합니다. evaluator는 그 파일과 OOD CSV의 SHA-256, 루트 health의
-checkpoint SHA-256·v7·두 threshold·`auth_required=true`, 모든 분석 응답의
-bool이 아닌 유한한 `latency_ms` 0~600000 계약을 함께 확인합니다.
+파일을 가리켜야 합니다. evaluator는 그 파일과 OOD CSV의 SHA-256뿐 아니라
+checkpoint 부모 디렉터리의 전체 모델 번들 SHA-256을 다시 계산하고, 루트 health의
+두 SHA-256·v7·두 threshold·`auth_required=true`, 모든 분석 응답의 bool이 아닌
+유한한 `latency_ms` 0~600000 계약을 함께 확인합니다. 모델 번들 해시는 디렉터리 아래
+모든 regular file의 정렬된 POSIX 상대경로 길이·상대경로·파일 길이·파일 바이트로
+계산합니다. 빈 번들, symlink 또는 특수 파일이 있으면 서버와 evaluator 모두
+fail-closed합니다.
 서버는 모호한 checkpoint 선택을 피하기 위해 해당 경로에 단일
 `model.safetensors` 또는 `pytorch_model.bin`이 있을 때만 준비 상태가 됩니다.
 `.bin` checkpoint이면 명령의 파일명도 `pytorch_model.bin`으로 바꿉니다.
 양성 예측은 고정한 `block_threshold` 이상으로 정의합니다. 통신 오류나 응답
-계약 오류가 한 건이라도 있으면 metrics를 `null`, 전체 `status`를 `invalid`로
+계약 오류가 한 건이라도 있으면 전체·하위 그룹 metrics를 `null`, `status`를 `invalid`로
 기록합니다. 전체 응답이 유효하면 F1과 Recall이 두 합격선을 모두 충족할 때만
 `status=passed`, `quality_passed=true`, 종료 코드 0입니다. 하나라도 미달이면
-metrics와 confusion을 보존한 채 `status=quality_failed`,
+전체·하위 그룹 metrics와 confusion을 보존한 채 `status=quality_failed`,
 `quality_passed=false`, 종료 코드 2입니다. 결과 파일은 새 파일로만 생성하므로 같은
 출력에 덮어써서 1회 평가 기록을 바꿀 수 없습니다. 최종 원자적 교체가 실패하면
 선점한 `invalid` 결과와 복구 가능한 임시 JSON을 삭제하지 않습니다.
