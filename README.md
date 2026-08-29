@@ -154,8 +154,8 @@ os.environ["AI_BASE_URL"] = "https://<현재-주소>.trycloudflare.com"
    않도록 두 합격선 모두 0.90 이상 1 이하만 허용합니다.
 3. 같은 Colab 런타임에서 라이브 서버를 연 뒤 아래 명령을 한 번 실행합니다.
 4. 생성된 aggregate JSON의 SHA-256과 전체·domain·domain×style별
-   precision/recall/F1/confusion을 공개합니다. OOD 원문·case ID·행별 예측은
-   공개하지 않습니다.
+   precision/recall/F1/confusion, server-side 모델 지연 통계를 공개합니다.
+   OOD 원문·case ID·행별 예측은 공개하지 않습니다.
 5. 결과를 본 뒤 checkpoint, threshold, 데이터 또는 전처리를 다시 고르지
    않습니다. 바꾸면 기존 OOD는 튜닝 데이터가 된 것이므로 새 독립 OOD로
    처음부터 다시 평가해야 합니다.
@@ -192,7 +192,13 @@ python eval_ood_final.py \
 파일을 가리켜야 합니다. evaluator는 그 파일과 OOD CSV의 SHA-256뿐 아니라
 checkpoint 부모 디렉터리의 전체 모델 번들 SHA-256을 다시 계산하고, 루트 health의
 두 SHA-256·v7·두 threshold·`auth_required=true`, 모든 분석 응답의 bool이 아닌
-유한한 `latency_ms` 0~600000 계약을 함께 확인합니다. 모델 번들 해시는 디렉터리 아래
+유한한 `latency_ms` 0~600000 계약을 함께 확인합니다. 유효한 응답의 값은
+aggregate JSON의 `model_latency_ms`에 count/min/mean/p50/p95/max로 기록합니다. p50과
+p95는 정렬된 표본의 1-based `ceil(p×n)` 위치를 취하는 nearest-rank이며 보간하지
+않아 표본 1건도 그 값으로 처리합니다. 이는 `server.py`가 토크나이즈부터
+모델 추론까지 측정한 server-side 지연으로, Agent↔AI 왕복 또는 종단 간 지연
+증거가 아닙니다. 확정된 지연 목표치가 없으므로 품질 합격 판정에는 영향을
+주지 않습니다. 모델 번들 해시는 디렉터리 아래
 모든 regular file의 정렬된 POSIX 상대경로 길이·상대경로·파일 길이·파일 바이트로
 계산합니다. 빈 번들, symlink 또는 특수 파일이 있으면 서버와 evaluator 모두
 fail-closed합니다.
@@ -200,8 +206,9 @@ fail-closed합니다.
 `model.safetensors` 또는 `pytorch_model.bin`이 있을 때만 준비 상태가 됩니다.
 `.bin` checkpoint이면 명령의 파일명도 `pytorch_model.bin`으로 바꿉니다.
 양성 예측은 고정한 `block_threshold` 이상으로 정의합니다. 통신 오류나 응답
-계약 오류가 한 건이라도 있으면 전체·하위 그룹 metrics를 `null`, `status`를 `invalid`로
-기록합니다. 전체 응답이 유효하면 F1과 Recall이 두 합격선을 모두 충족할 때만
+계약 오류가 한 건이라도 있으면 전체·하위 그룹 metrics와 `model_latency_ms`를
+`null`, `status`를 `invalid`로 기록합니다. 전체 응답이 유효하면 F1과 Recall이
+두 합격선을 모두 충족할 때만
 `status=passed`, `quality_passed=true`, 종료 코드 0입니다. 하나라도 미달이면
 전체·하위 그룹 metrics와 confusion을 보존한 채 `status=quality_failed`,
 `quality_passed=false`, 종료 코드 2입니다. 결과 파일은 새 파일로만 생성하므로 같은

@@ -364,7 +364,7 @@ def validate_analysis_response(
     response: dict[str, object],
     event_id: str,
     lock: dict[str, object],
-) -> float:
+) -> tuple[float, float]:
     try:
         score = _finite_number(response.get("confidence_score"), "confidence_score")
         latency = _finite_number(response.get("latency_ms"), "latency_ms")
@@ -383,7 +383,7 @@ def validate_analysis_response(
         or response.get("decision") != decision
     ):
         raise ContractError("live API 응답 계약이 lock 또는 요청과 다릅니다.")
-    return score
+    return score, latency
 
 
 def compute_metrics(labels: list[int], predictions: list[int]) -> dict[str, object]:
@@ -439,6 +439,29 @@ def compute_group_metrics(
     return result
 
 
+def summarize_model_latency(values: list[float]) -> dict[str, object]:
+    numbers = [_finite_number(value, "model latency_ms") for value in values]
+    if not numbers:
+        raise GateError("model latency_ms 집계에 유효한 값이 없습니다.")
+    if any(not 0 <= value <= 600000 for value in numbers):
+        raise GateError("model latency_ms는 0~600000 범위여야 합니다.")
+
+    numbers.sort()
+    count = len(numbers)
+
+    def nearest_rank(percent: int) -> float:
+        return numbers[(percent * count + 99) // 100 - 1]
+
+    return {
+        "count": count,
+        "min": numbers[0],
+        "mean": math.fsum(numbers) / count,
+        "p50": nearest_rank(50),
+        "p95": nearest_rank(95),
+        "max": numbers[-1],
+    }
+
+
 def invalid_outcome(reason: str, completed: int) -> dict[str, object]:
     return {
         "status": "invalid",
@@ -450,24 +473,27 @@ def invalid_outcome(reason: str, completed: int) -> dict[str, object]:
         "metrics": None,
         "metrics_by_domain": None,
         "metrics_by_domain_style": None,
+        "model_latency_ms": None,
     }
 
 
 def evaluate_rows(rows, lock, request_case) -> dict[str, object]:
     labels: list[int] = []
     predictions: list[int] = []
+    latencies: list[float] = []
     for index, row in enumerate(rows, start=1):
         case_hash = hashlib.sha256(str(row["case_id"]).encode("utf-8")).hexdigest()
         event_id = f"ood-final-{index:04d}-{case_hash[:12]}"
         try:
             response = request_case(row, event_id)
-            score = validate_analysis_response(response, event_id, lock)
+            score, latency = validate_analysis_response(response, event_id, lock)
         except TransportError:
             return invalid_outcome("transport_error", index - 1)
         except (ContractError, GateError):
             return invalid_outcome("contract_error", index - 1)
         labels.append(int(row["label"]))
         predictions.append(int(score >= float(lock["block_threshold"])))
+        latencies.append(latency)
     metrics = compute_metrics(labels, predictions)
     metrics_by_domain = compute_group_metrics(rows, predictions, ("domain",))
     metrics_by_domain_style = compute_group_metrics(
@@ -487,6 +513,7 @@ def evaluate_rows(rows, lock, request_case) -> dict[str, object]:
         "metrics": metrics,
         "metrics_by_domain": metrics_by_domain,
         "metrics_by_domain_style": metrics_by_domain_style,
+        "model_latency_ms": summarize_model_latency(latencies),
     }
 
 

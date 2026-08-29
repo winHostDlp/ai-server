@@ -279,6 +279,14 @@ def test_complete_evaluation_passes_or_preserves_failed_quality_metrics() -> Non
     assert passed["status"] == "passed"
     assert passed["quality_passed"] is True
     assert passed["metrics"]["f1"] == 1.0
+    assert passed["model_latency_ms"] == {
+        "count": 2,
+        "min": 1.0,
+        "mean": 1.0,
+        "p50": 1.0,
+        "p95": 1.0,
+        "max": 1.0,
+    }
 
     failed = evaluate([0.1, 0.1])
     assert failed["status"] == "quality_failed"
@@ -379,7 +387,10 @@ def test_analysis_latency_accepts_contract_boundaries(latency: float) -> None:
         "latency_ms": latency,
     }
 
-    assert gate.validate_analysis_response(response, "latency-boundary", lock) == 0.9
+    assert gate.validate_analysis_response(response, "latency-boundary", lock) == (
+        0.9,
+        float(latency),
+    )
 
 
 @pytest.mark.parametrize(
@@ -398,6 +409,33 @@ def test_analysis_latency_rejects_invalid_contract_values(latency: object) -> No
 
     with pytest.raises(gate.ContractError):
         gate.validate_analysis_response(response, "invalid-latency", lock)
+
+
+def test_model_latency_summary_uses_nearest_rank_and_rejects_invalid_values() -> None:
+    assert gate.summarize_model_latency([4.0, 1.0, 3.0, 2.0]) == {
+        "count": 4,
+        "min": 1.0,
+        "mean": 2.5,
+        "p50": 2.0,
+        "p95": 4.0,
+        "max": 4.0,
+    }
+    assert gate.summarize_model_latency([7.5])["p95"] == 7.5
+    assert gate.summarize_model_latency(
+        [float(value) for value in range(1, 21)]
+    )["p95"] == 19.0
+
+    invalid_values = (
+        [],
+        [True],
+        [float("nan")],
+        [float("inf")],
+        [-0.01],
+        [600000.01],
+    )
+    for invalid in invalid_values:
+        with pytest.raises(gate.GateError):
+            gate.summarize_model_latency(invalid)
 
 
 def test_one_transport_error_invalidates_all_metrics() -> None:
@@ -431,6 +469,7 @@ def test_one_transport_error_invalidates_all_metrics() -> None:
     assert result["metrics"] is None
     assert result["metrics_by_domain"] is None
     assert result["metrics_by_domain_style"] is None
+    assert result["model_latency_ms"] is None
 
 
 def test_incomplete_http_body_is_a_transport_error(
