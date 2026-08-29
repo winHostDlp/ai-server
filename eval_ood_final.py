@@ -337,10 +337,13 @@ def validate_health(response: dict[str, object], lock: dict[str, object]) -> Non
         response.get("status") != "running"
         or response.get("engine") != lock["model_version"]
         or response.get("checkpoint_sha256") != lock["checkpoint_sha256"]
+        or response.get("auth_required") is not True
         or block != lock["block_threshold"]
         or review != lock["review_threshold"]
     ):
-        raise ContractError("live API checkpoint, 모델 버전 또는 threshold가 lock과 다릅니다.")
+        raise ContractError(
+            "live API checkpoint, 모델 버전, 인증 또는 threshold가 lock과 다릅니다."
+        )
 
 
 def validate_analysis_response(
@@ -353,7 +356,7 @@ def validate_analysis_response(
         latency = _finite_number(response.get("latency_ms"), "latency_ms")
     except GateError as exc:
         raise ContractError(str(exc)) from exc
-    if not 0 <= score <= 1 or latency < 0:
+    if not 0 <= score <= 1 or not 0 <= latency <= 600000:
         raise ContractError("live API 점수 또는 지연시간 범위가 잘못되었습니다.")
     decision = expected_decision(
         score,

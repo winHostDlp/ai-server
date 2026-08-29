@@ -252,19 +252,55 @@ def test_live_health_must_match_locked_model_and_thresholds() -> None:
         "status": "running",
         "engine": gate.MODEL_VERSION,
         "checkpoint_sha256": lock["checkpoint_sha256"],
+        "auth_required": True,
         "block_threshold": 0.41,
         "review_threshold": 0.20,
     }
     gate.validate_health(valid, lock)
 
     for invalid in (
+        {key: value for key, value in valid.items() if key != "auth_required"},
         {**valid, "engine": "koelectra-dlp-v6"},
         {**valid, "checkpoint_sha256": _digest(b"other checkpoint")},
         {**valid, "block_threshold": 0.42},
+        {**valid, "auth_required": False},
+        {**valid, "auth_required": 1},
         {**valid, "status": "model_load_failed"},
     ):
         with pytest.raises(gate.ContractError):
             gate.validate_health(invalid, lock)
+
+
+@pytest.mark.parametrize("latency", [0, 600000])
+def test_analysis_latency_accepts_contract_boundaries(latency: float) -> None:
+    lock = gate.validate_lock(_lock())
+    response = {
+        "event_id": "latency-boundary",
+        "decision": "block",
+        "confidence_score": 0.9,
+        "model_version": gate.MODEL_VERSION,
+        "latency_ms": latency,
+    }
+
+    assert gate.validate_analysis_response(response, "latency-boundary", lock) == 0.9
+
+
+@pytest.mark.parametrize(
+    "latency",
+    [True, float("nan"), float("inf"), -0.01, 600000.01],
+)
+def test_analysis_latency_rejects_invalid_contract_values(latency: object) -> None:
+    lock = gate.validate_lock(_lock())
+    response = {
+        "event_id": "invalid-latency",
+        "decision": "block",
+        "confidence_score": 0.9,
+        "model_version": gate.MODEL_VERSION,
+        "latency_ms": latency,
+    }
+
+    with pytest.raises(gate.ContractError):
+        gate.validate_analysis_response(response, "invalid-latency", lock)
 
 
 def test_one_transport_error_invalidates_all_metrics() -> None:

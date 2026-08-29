@@ -70,7 +70,7 @@ os.environ["AI_API_TOKEN"] = secrets.token_urlsafe(32)
 | `decision` | string | `allow` / `review` / `block` |
 | `confidence_score` | float | 0.0 ~ 1.0, 기밀일 확률 |
 | `model_version` | string | 현재: `koelectra-dlp-v7` |
-| `latency_ms` | float | AI 서버 내부 추론 소요 시간(ms) |
+| `latency_ms` | float | AI 서버 내부 추론 소요 시간(ms). bool이 아닌 유한한 0~600000 |
 | `reason` | string | 판정 사유 요약 |
 
 ### Response 예시
@@ -167,6 +167,11 @@ domain×style 조합에는 label 0/1이 모두 있어야 합니다. 실제 총 �
 manifest의 `expected_rows`와 정확히 일치해야 합니다.
 스크립트는 내부 중복과 추적된 `train_dataset_v6.csv` /
 `hard_test_set_v1.csv`의 정규화 exact-overlap도 네트워크 호출 전에 거절합니다.
+현재 gate가 보장하는 범위는 저장소 밖에 고정된 blind OOD, label 균형,
+domain/style 내부 구성 조건, 추적 train/hard 데이터와의 exact text-overlap 차단까지입니다.
+CSV에 적힌 domain/style만으로 truly held-out domain/style을 증명하지는 않습니다.
+그 주장을 하려면 평가 전에 domain/style 목록을 고정하고, 학습 데이터의 domain 목록과
+불교집합임을 확인할 수 있는 근거를 별도로 추가해야 합니다.
 
 ```bash
 export AI_BASE_URL="https://<현재-주소>.trycloudflare.com"
@@ -180,7 +185,8 @@ python eval_ood_final.py \
 
 `--checkpoint-file`은 실행 중인 서버의 `SENTRY_MODEL_PATH`가 실제로 읽은 weights
 파일을 가리켜야 합니다. evaluator는 그 파일과 OOD CSV의 SHA-256, 루트 health의
-checkpoint SHA-256·v7·두 threshold, 모든 분석 응답 계약을 함께 확인합니다.
+checkpoint SHA-256·v7·두 threshold·`auth_required=true`, 모든 분석 응답의
+bool이 아닌 유한한 `latency_ms` 0~600000 계약을 함께 확인합니다.
 서버는 모호한 checkpoint 선택을 피하기 위해 해당 경로에 단일
 `model.safetensors` 또는 `pytorch_model.bin`이 있을 때만 준비 상태가 됩니다.
 `.bin` checkpoint이면 명령의 파일명도 `pytorch_model.bin`으로 바꿉니다.
