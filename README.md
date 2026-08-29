@@ -126,7 +126,16 @@ curl -X POST {BASE_URL}/api/v1/analyze \
 
 Swagger UI: `{BASE_URL}/docs`
 
-토큰만 확인할 때는 추론·이벤트 로그를 만들지 않는 `GET {BASE_URL}/api/v1/agent-check`에 같은 Bearer 헤더를 사용합니다. `batch_test_live_api.py`는 v6 학습 데이터와 하드케이스를 대상으로 응답의 `event_id`, 점수-판정 경계, `koelectra-dlp-v7`, 지연시간 계약까지 확인한 뒤 정상 건만 성공 집계합니다. 401·422와 응답 계약 위반은 재호출하지 않으며, 재시도는 일시적인 통신 오류와 408/425/429/5xx에만 적용합니다. 이 배치에는 학습 데이터가 포함되므로 **held-out 모델 품질 증거로 사용하지 않습니다.**
+토큰만 확인할 때는 추론·이벤트 로그를 만들지 않는 `GET {BASE_URL}/api/v1/agent-check`에 같은 Bearer 헤더를 사용합니다. 서버 셀에 Cloudflare 주소가 표시된 뒤 새 셀에서 아래처럼 배치 검증을 실행합니다.
+
+```python
+import os
+
+os.environ["AI_BASE_URL"] = "https://<현재-주소>.trycloudflare.com"
+%run batch_test_live_api.py
+```
+
+`batch_test_live_api.py`는 추적 파일을 수정하지 않고 `AI_BASE_URL` 환경변수의 현재 HTTPS 도메인을 사용하며, 주소가 없거나 경로까지 포함되면 패키지 설치 전에 중단합니다. 이 스크립트는 v6 학습 데이터와 하드케이스를 대상으로 응답의 `event_id`, 점수-판정 경계, `koelectra-dlp-v7`, 지연시간 계약까지 확인한 뒤 정상 건만 성공 집계합니다. 401·422와 응답 계약 위반은 재호출하지 않으며, 재시도는 일시적인 통신 오류와 408/425/429/5xx에만 적용합니다. 이 배치에는 학습 데이터가 포함되므로 **held-out 모델 품질 증거로 사용하지 않습니다.**
 
 ## 7. 현재 발표 통합 토폴로지
 

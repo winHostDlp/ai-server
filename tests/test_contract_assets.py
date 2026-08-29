@@ -3,10 +3,12 @@ from __future__ import annotations
 import ast
 import asyncio
 import math
+import os
 import secrets
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Annotated, Literal, Optional
+from urllib.parse import urlsplit
 
 import pytest
 from fastapi.responses import JSONResponse
@@ -388,6 +390,33 @@ def test_batch_response_contract_rejects_semantic_mismatches() -> None:
             validate(response, "batch-12345678")
 
 
+def test_batch_live_api_requires_runtime_https_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    require_base_url = _load_function(
+        "batch_test_live_api.py",
+        "require_ai_base_url",
+        {"os": os, "urlsplit": urlsplit},
+    )
+
+    invalid_values = (
+        None,
+        " ",
+        "http://demo.test",
+        "https://demo.test/api/v1/analyze",
+    )
+    for invalid in invalid_values:
+        if invalid is None:
+            monkeypatch.delenv("AI_BASE_URL", raising=False)
+        else:
+            monkeypatch.setenv("AI_BASE_URL", invalid)
+        with pytest.raises(RuntimeError):
+            require_base_url()
+
+    monkeypatch.setenv("AI_BASE_URL", "  https://demo.trycloudflare.com/  ")
+    assert require_base_url() == "https://demo.trycloudflare.com"
+
+
 def test_v7_evaluation_scripts_use_tracked_inputs_and_current_thresholds() -> None:
     train = _literal_assignments("train_koelectra_v7.py")
     hard = _literal_assignments("eval_hard_cases.py")
@@ -408,6 +437,11 @@ def test_v7_evaluation_scripts_use_tracked_inputs_and_current_thresholds() -> No
     assert threshold["CURRENT_THRESHOLD"] == 0.41
     assert threshold["REVIEW_THRESHOLD"] == 0.20
     assert str(batch["TRAIN_DATA_PATH"]).endswith("train_dataset_v6.csv")
+    batch_source = _source("batch_test_live_api.py")
+    assert "BASE_URL = require_ai_base_url()" in batch_source
+    assert batch_source.index("BASE_URL = require_ai_base_url()") < batch_source.index(
+        "subprocess.run("
+    )
     assert '"channel": "clipboard"' in _source("batch_test_live_api.py")
     assert 'eval_strategy="epoch"' in _source("train_koelectra_v7.py")
     assert '"transformers>=4.41,<5"' in _source("train_koelectra_v7.py")

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 import uuid
+from urllib.parse import urlsplit
 
 AI_API_TOKEN = os.environ.get("AI_API_TOKEN", "").strip()
 try:
@@ -16,6 +17,25 @@ except UnicodeEncodeError as exc:
     raise RuntimeError("AI_API_TOKEN은 ASCII 무작위 문자열이어야 합니다.") from exc
 if len(AI_API_TOKEN_BYTES) < 32:
     raise RuntimeError("32자 이상의 ASCII AI_API_TOKEN 환경변수가 필요합니다.")
+
+
+def require_ai_base_url() -> str:
+    base_url = os.environ.get("AI_BASE_URL", "").strip().rstrip("/")
+    parsed = urlsplit(base_url)
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RuntimeError(
+            "AI_BASE_URL에는 https:// 형식의 현재 Cloudflare 도메인만 설정하세요."
+        )
+    return base_url
+
+
+BASE_URL = require_ai_base_url()
 
 subprocess.run(
     [sys.executable, "-m", "pip", "install", "-q", "requests", "pandas"],
@@ -28,8 +48,6 @@ import requests
 # =====================================================================
 # 0. 설정값
 # =====================================================================
-# 위 서버 실행 셀에서 나온 출력의 "에이전트 연동 엔드포인트" 앞부분(도메인)을 그대로 쓰면 됩니다.
-BASE_URL = "https://여기에-현재-cloudflare-URL을-붙여넣으세요.trycloudflare.com"
 ANALYZE_ENDPOINT = f"{BASE_URL}/api/v1/analyze"
 
 # 드라이브 경로에 맞게 필요시 수정하세요
