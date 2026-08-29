@@ -3,11 +3,12 @@
 threshold_analysis.py
 
 목적: v7 block/review 컷라인의 수학적 근거를 재검증하기 위한 ROC / PR 곡선 분석
-- 입력 1: test_predictions_v7.csv   (재학습 시 생성된 정식 Test셋 예측 결과)
-- 입력 2: hard_test_results_v7.csv  (하드케이스 검증셋 예측 결과)
-  -> 둘을 합쳐서 분석해야 의미가 있습니다. 정식 Test셋만 쓰면 확률이
+- 입력 1: validation_predictions_v7.csv (재학습 시 생성된 검증셋 예측 결과)
+- 입력 2: hard_test_results_v7.csv       (경계 하드케이스 보정 결과)
+  -> 둘을 합쳐 임계값 후보를 선정합니다. 검증셋만 쓰면 확률이
      0.99+/0.01- 로 양극단에 몰려 있어 곡선이 사실상 무의미합니다.
      하드케이스가 섞여야 "애매한 경계 구간"이 곡선에 반영됩니다.
+- 입력 3: test_predictions_v7.csv (임계값 선정에 사용하지 않는 최종 확인용)
 
 출력:
 - threshold_analysis.png (ROC curve + PR curve, 후보 threshold 표시)
@@ -24,8 +25,9 @@ from sklearn.metrics import (
     precision_score, recall_score, f1_score
 )
 
-TEST_PRED_PATH = "test_predictions_v7.csv"
+VALIDATION_PRED_PATH = "validation_predictions_v7.csv"
 HARD_PRED_PATH = "hard_test_results_v7.csv"
+HELD_OUT_TEST_PRED_PATH = "test_predictions_v7.csv"
 CURRENT_THRESHOLD = 0.41
 REVIEW_THRESHOLD = 0.20
 OUTPUT_PNG = "threshold_analysis.png"
@@ -34,18 +36,20 @@ OUTPUT_CSV = "threshold_candidates.csv"
 # ------------------------------------------------------------------
 # 1. 데이터 로드 및 병합
 # ------------------------------------------------------------------
-test_df = pd.read_csv(TEST_PRED_PATH)[["text", "label", "prob_sensitive"]]
+validation_df = pd.read_csv(VALIDATION_PRED_PATH)[["text", "label", "prob_sensitive"]]
 hard_df = pd.read_csv(HARD_PRED_PATH)[["text", "label", "prob_sensitive"]]
+test_df = pd.read_csv(HELD_OUT_TEST_PRED_PATH)[["text", "label", "prob_sensitive"]]
 
-combined = pd.concat([test_df, hard_df], ignore_index=True)
+combined = pd.concat([validation_df, hard_df], ignore_index=True)
 combined = combined.drop_duplicates(subset=["text"]).reset_index(drop=True)
 
 y_true = combined["label"].values
 y_prob = combined["prob_sensitive"].values
 
-print(f"[INFO] 정식 Test셋: {len(test_df)}건 / 하드케이스: {len(hard_df)}건")
-print(f"[INFO] 병합(중복 제거) 후 전체 평가셋: {len(combined)}건 "
+print(f"[INFO] Validation: {len(validation_df)}건 / 하드케이스: {len(hard_df)}건")
+print(f"[INFO] 임계값 보정셋(중복 제거): {len(combined)}건 "
       f"(label 분포: {combined['label'].value_counts().to_dict()})")
+print(f"[INFO] 임계값 선정에서 제외한 최종 Test셋: {len(test_df)}건")
 
 # ------------------------------------------------------------------
 # 2. ROC Curve + Youden's J statistic
@@ -87,14 +91,14 @@ print(f"[PR] F2 최적 threshold = {best_f2_threshold:.4f} "
 # ------------------------------------------------------------------
 # 4. 후보 threshold 비교표
 # ------------------------------------------------------------------
-def eval_at(th):
-    pred = (y_prob >= th).astype(int)
+def eval_at(th, labels=y_true, probabilities=y_prob):
+    pred = (probabilities >= th).astype(int)
     return {
         "threshold": round(th, 4),
-        "precision": round(precision_score(y_true, pred, zero_division=0), 4),
-        "recall": round(recall_score(y_true, pred, zero_division=0), 4),
-        "f1": round(f1_score(y_true, pred, zero_division=0), 4),
-        "f2": round(fbeta_score(y_true, pred, beta=2, zero_division=0), 4),
+        "precision": round(precision_score(labels, pred, zero_division=0), 4),
+        "recall": round(recall_score(labels, pred, zero_division=0), 4),
+        "f1": round(f1_score(labels, pred, zero_division=0), 4),
+        "f2": round(fbeta_score(labels, pred, beta=2, zero_division=0), 4),
     }
 
 candidates = pd.DataFrame([
@@ -108,6 +112,15 @@ print("\n=== Threshold 후보 비교표 ===")
 print(candidates.to_string(index=False))
 candidates.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
 print(f"\n[INFO] 비교표 저장: {OUTPUT_CSV}")
+
+test_metrics = eval_at(
+    CURRENT_THRESHOLD,
+    test_df["label"].values,
+    test_df["prob_sensitive"].values,
+)
+print("\n=== 고정된 현재 block threshold의 최종 Test 지표 ===")
+print(test_metrics)
+print("[주의] 이 결과를 본 뒤 threshold를 다시 고르면 Test셋은 더 이상 held-out이 아닙니다.")
 
 # ------------------------------------------------------------------
 # 5. 시각화 (ROC + PR curve, 후보 threshold 표시)

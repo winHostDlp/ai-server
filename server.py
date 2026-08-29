@@ -10,6 +10,7 @@ import json
 import hashlib
 import queue
 import secrets
+import shutil
 import threading
 import subprocess
 import traceback
@@ -39,7 +40,7 @@ subprocess.run(
         "uvicorn>=0.23,<1",
         "pydantic>=2,<3",
         "torch>=2,<3",
-        "transformers>=4.30,<5",
+        "transformers>=4.41,<5",
     ],
     check=True,
 )
@@ -70,7 +71,9 @@ def ensure_cloudflared() -> None:
 
     download_path = CLOUDFLARED_PATH + ".download"
     try:
-        urllib.request.urlretrieve(CLOUDFLARED_URL, download_path)
+        with urllib.request.urlopen(CLOUDFLARED_URL, timeout=60) as response:
+            with open(download_path, "wb") as file_obj:
+                shutil.copyfileobj(response, file_obj)
         actual_sha256 = sha256_file(download_path)
         if not secrets.compare_digest(actual_sha256, CLOUDFLARED_SHA256):
             raise RuntimeError("cloudflared SHA-256 검증에 실패했습니다.")
@@ -84,7 +87,8 @@ def ensure_cloudflared() -> None:
 import torch
 import torch.nn.functional as F
 import uvicorn
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
@@ -113,13 +117,15 @@ LOG_DIR = os.environ.get(
 )
 LOG_PATH = os.path.join(LOG_DIR, "analyze_log.jsonl")
 os.makedirs(LOG_DIR, exist_ok=True)
+MAX_ANALYZE_BODY_BYTES = 256 * 1024
+_LOG_LOCK = threading.Lock()
 
 
 def log_event(record: dict) -> None:
     """요청/응답 1건을 JSONL 파일에 한 줄씩 append. 로깅 실패가 API 응답을 막지 않도록 예외 흡수."""
     record["logged_at"] = datetime.now(timezone.utc).isoformat()
     try:
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
+        with _LOG_LOCK, open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception:
         traceback.print_exc()
@@ -184,22 +190,103 @@ def to_decision(confidence_score: float) -> Literal["allow", "review", "block"]:
 def verify_ai_token(
     authorization: Optional[str] = Header(default=None),
 ) -> None:
+    if not is_valid_ai_token(authorization):
+        raise HTTPException(status_code=401, detail="Invalid or missing AI token.")
+
+
+def is_valid_ai_token(authorization: Optional[str]) -> bool:
     scheme, _, provided_token = (authorization or "").partition(" ")
     try:
         provided_token_bytes = provided_token.encode("ascii")
     except UnicodeEncodeError:
         provided_token_bytes = b""
-    if (
+    return not (
         scheme.lower() != "bearer"
         or not provided_token
         or not secrets.compare_digest(provided_token_bytes, AI_API_TOKEN_BYTES)
-    ):
-        raise HTTPException(status_code=401, detail="Invalid or missing AI token.")
+    )
+
+
+def validate_model_config(model_obj) -> None:
+    config = model_obj.config
+    if getattr(config, "sentry_model_version", "") != MODEL_VERSION:
+        raise RuntimeError(
+            f"모델 체크포인트 버전이 {MODEL_VERSION}으로 확인되지 않았습니다."
+        )
+    if int(getattr(config, "num_labels", 0)) != 2:
+        raise RuntimeError("모델 분류 헤드는 2개 label이어야 합니다.")
+    if getattr(config, "id2label", {}).get(1) != "sensitive":
+        raise RuntimeError("모델 label 1은 sensitive여야 합니다.")
+
+
+class _RequestBodyTooLarge(Exception):
+    pass
+
+
+class AnalyzeRequestGuard:
+    """Authenticate and cap analyze bodies before FastAPI parses JSON."""
+
+    def __init__(self, app_obj) -> None:
+        self.app = app_obj
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope.get("type") != "http" or scope.get("path") != "/api/v1/analyze":
+            await self.app(scope, receive, send)
+            return
+
+        headers = {name.lower(): value for name, value in scope.get("headers", [])}
+        try:
+            authorization = headers.get(b"authorization", b"").decode("ascii")
+        except UnicodeDecodeError:
+            authorization = ""
+        if not is_valid_ai_token(authorization):
+            await JSONResponse(
+                status_code=401,
+                content={"detail": "Invalid or missing AI token."},
+            )(scope, receive, send)
+            return
+
+        content_length = headers.get(b"content-length")
+        if content_length is not None:
+            try:
+                declared_size = int(content_length)
+            except ValueError:
+                await JSONResponse(
+                    status_code=400,
+                    content={"detail": "Content-Length must be an integer."},
+                )(scope, receive, send)
+                return
+            if declared_size < 0 or declared_size > MAX_ANALYZE_BODY_BYTES:
+                await JSONResponse(
+                    status_code=413,
+                    content={"detail": "Analysis request body is too large."},
+                )(scope, receive, send)
+                return
+
+        received_size = 0
+
+        async def receive_limited():
+            nonlocal received_size
+            message = await receive()
+            if message.get("type") == "http.request":
+                received_size += len(message.get("body", b""))
+                if received_size > MAX_ANALYZE_BODY_BYTES:
+                    raise _RequestBodyTooLarge
+            return message
+
+        try:
+            await self.app(scope, receive_limited, send)
+        except _RequestBodyTooLarge:
+            await JSONResponse(
+                status_code=413,
+                content={"detail": "Analysis request body is too large."},
+            )(scope, receive, send)
 
 # =====================================================================
 # 4. FastAPI 앱 초기화 및 모델 로드
 # =====================================================================
 app = FastAPI(title="Sentry AI DLP Server", version=MODEL_VERSION)
+app.add_middleware(AnalyzeRequestGuard)
 
 print(f"\n=======================================================")
 print(f"🔥 현재 AI 연산 환경: [{DEVICE.upper()}] 🔥")
@@ -213,7 +300,19 @@ tokenizer = None
 try:
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
     model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH).to(DEVICE)
+    validate_model_config(model)
     model.eval()
+    warmup_inputs = tokenizer(
+        "DLP 모델 준비 상태 확인",
+        return_tensors="pt",
+        truncation=True,
+        max_length=128,
+        padding="max_length",
+    ).to(DEVICE)
+    with torch.inference_mode():
+        warmup_logits = model(**warmup_inputs).logits
+    if tuple(warmup_logits.shape) != (1, 2) or not torch.isfinite(warmup_logits).all().item():
+        raise RuntimeError("모델 준비 추론 결과가 유효하지 않습니다.")
     model_loaded = True
     print("✅ 분석 엔진 탑재 성공! 실시간 탐지 대기 중입니다.")
 except Exception as e:
@@ -224,7 +323,11 @@ except Exception as e:
 # 5. 실시간 판별 API 핵심 로직
 # =====================================================================
 @app.post("/api/v1/analyze", response_model=AgentResponse)
-def analyze_text(request: AgentRequest, _: None = Depends(verify_ai_token)):
+def analyze_text(
+    request: AgentRequest,
+    background_tasks: BackgroundTasks,
+    _: None = Depends(verify_ai_token),
+):
     user_id_hash = pseudonymize_user_id(request.user_id)
     if not model_loaded:
         log_event({
@@ -242,7 +345,7 @@ def analyze_text(request: AgentRequest, _: None = Depends(verify_ai_token)):
         raise HTTPException(status_code=400, detail="분석할 콘텐츠(snippet)가 비어 있습니다.")
 
     try:
-        start_time = time.time()
+        start_time = time.perf_counter()
         inputs = tokenizer(
             request.snippet,
             return_tensors="pt",
@@ -256,7 +359,7 @@ def analyze_text(request: AgentRequest, _: None = Depends(verify_ai_token)):
             probs = F.softmax(outputs.logits, dim=-1)
             confidence_score = round(probs[0][1].item(), 4)
 
-        latency_ms = round((time.time() - start_time) * 1000, 2)
+        latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
         decision = to_decision(confidence_score)
 
         reason_map = {
@@ -265,7 +368,7 @@ def analyze_text(request: AgentRequest, _: None = Depends(verify_ai_token)):
             "allow": "정상 비즈니스 문맥으로 판정",
         }
 
-        log_event({
+        background_tasks.add_task(log_event, {
             "event_id": request.event_id,
             "channel": request.channel,
             "user_id_hash": user_id_hash,

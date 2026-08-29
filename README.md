@@ -27,7 +27,9 @@ os.environ["AI_API_TOKEN"] = secrets.token_urlsafe(32)
 
 같은 `AI_API_TOKEN`을 Host의 환경변수 또는 Git에서 제외된 `config/settings.local.yaml`의 `server.ai_token`, Web의 `AI_SERVER_TOKEN`에 설정하되 추적 설정·Git·채팅·발표 화면에 값을 남기지 않습니다. Host 환경변수가 local YAML보다 우선합니다.
 
-`server.py`는 **Google Colab의 Linux amd64 런타임 전용**이며, Colab 셀 붙여넣기와 그 런타임 안의 `python server.py` 실행을 지원합니다. macOS·Windows·ARM·일반 로컬 Python 실행 지원을 뜻하지 않습니다. 독립 실행은 `Ctrl+C`까지 유지되고, Colab에서 셀을 다시 실행할 때는 그 셀이 앞서 만든 서버·터널만 종료합니다. 터널이 예기치 않게 종료되면 연결이 끊긴 로컬 API도 중단하며, 다른 `cloudflared` 프로세스는 광역 종료하지 않습니다. 내려받는 `cloudflared`는 `2026.8.2` Linux amd64와 공식 SHA-256으로 고정·검증합니다. FastAPI·Uvicorn·Pydantic·PyTorch·Transformers는 코드가 전제한 호환 메이저 범위로 설치해 기존 Pydantic v1 환경을 그대로 사용하지 않습니다.
+`server.py`는 **Google Colab의 Linux amd64 런타임 전용**이며, Colab 셀 붙여넣기와 그 런타임 안의 `python server.py` 실행을 지원합니다. macOS·Windows·ARM·일반 로컬 Python 실행 지원을 뜻하지 않습니다. 독립 실행은 `Ctrl+C`까지 유지되고, Colab에서 셀을 다시 실행할 때는 그 셀이 앞서 만든 서버·터널만 종료합니다. 터널이 예기치 않게 종료되면 연결이 끊긴 로컬 API도 중단하며, 다른 `cloudflared` 프로세스는 광역 종료하지 않습니다. 내려받는 `cloudflared`는 `2026.8.2` Linux amd64와 공식 SHA-256으로 고정·검증하며, 다운로드가 60초 동안 응답하지 않으면 중단합니다. FastAPI·Uvicorn·Pydantic·PyTorch·Transformers는 코드가 전제한 호환 메이저 범위로 설치해 기존 Pydantic v1 환경을 그대로 사용하지 않습니다.
+
+서버는 체크포인트의 `sentry_model_version`, 2-label 구성, `label 1 = sensitive` 매핑과 준비 추론을 모두 확인한 뒤에만 `status=running`을 반환합니다. 기존 Drive 체크포인트에 이 메타데이터가 없다면 이름만 보고 v7로 간주하지 않고 분석 준비를 거절하므로, 현재 `train_koelectra_v7.py`로 재학습한 `final` 체크포인트를 사용해야 합니다.
 
 ## 2. Request
 
@@ -41,6 +43,8 @@ os.environ["AI_API_TOKEN"] = secrets.token_urlsafe(32)
 | `metadata` | object | X | 최대 50개 항목. 키 1~100자, 문자열 값 최대 500자, 수치는 유한값만 허용 |
 
 모델 문맥을 위해 Host가 `snippet` 원문을 전송하므로 실제 개인정보·운영 비밀은 시연에 사용하지 않습니다. AI 서버 JSONL에는 snippet 원문/미리보기 대신 길이만, `user_id` 대신 SHA-256 기반 가명값만 기록합니다.
+
+`/api/v1/analyze`는 JSON을 읽기 전에 Bearer 토큰을 확인합니다. `Content-Length`가 있으면 크기를 먼저 검사하고, chunked 요청도 수신 중 합계를 검사해 본문을 256 KiB로 제한합니다. 성공 감사 로그는 응답 후 백그라운드에서 기록됩니다.
 
 ### Request 예시
 ```json
@@ -89,14 +93,15 @@ os.environ["AI_API_TOKEN"] = secrets.token_urlsafe(32)
 | 0.20 이상 0.41 미만 | review |
 | < 0.20 | allow |
 
-`server.py`에 적용된 현재 값입니다. 저장소에는 v7 모델 가중치·실행 산출물이 없으므로 `train_koelectra_v7.py` → `eval_hard_cases.py` → `threshold_analysis.py`를 같은 checkpoint로 재실행하고 생성된 `test_predictions_v7.csv`, `hard_test_results_v7.csv`, `threshold_candidates.csv`를 검토하기 전에는 0.41/0.20을 재현 검증 완료로 표현하지 않습니다. 모델 재학습 시 threshold도 다시 산정합니다.
+`server.py`에 적용된 현재 값입니다. 저장소에는 v7 모델 가중치·실행 산출물이 없으므로 `train_koelectra_v7.py` → `eval_hard_cases.py` → `threshold_analysis.py`를 같은 checkpoint로 재실행해야 합니다. 학습 스크립트는 Train/Validation/Test를 60/20/20으로 분리하고, early stopping은 Validation만 사용합니다. 임계값 후보는 `validation_predictions_v7.csv`와 `hard_test_results_v7.csv`로 고른 뒤 `test_predictions_v7.csv`는 최종 확인에 한 번만 사용합니다. 결과를 본 뒤 임계값을 다시 고르면 Test는 더 이상 held-out 증거가 아닙니다. `threshold_candidates.csv`까지 검토하기 전에는 0.41/0.20을 재현 검증 완료로 표현하지 않습니다.
 
 ## 5. 에러 응답
 
 | status code | 상황 |
 |---|---|
 | 401 | Bearer 토큰 누락 또는 불일치 |
-| 400 | `snippet`이 비어있음 |
+| 400 | `snippet`이 비어있거나 `Content-Length` 형식이 잘못됨 |
+| 413 | 요청 본문이 256 KiB 초과 |
 | 422 | 요청 스키마 검증 실패 |
 | 503 | AI 모델이 로드되지 않은 상태 (서버 기동 직후 등) |
 | 500 | 추론 중 내부 오류. 응답과 JSONL에는 내부 예외 문자열을 노출하지 않음 |

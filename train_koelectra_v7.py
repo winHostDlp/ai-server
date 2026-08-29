@@ -6,10 +6,10 @@ train_koelectra_v7.py
 - 기존 train_dataset_v5.csv(183건, 격식체만)의 한계였던 "구어체 미학습" 문제를 보완
 - register_augment_v1.csv(구어체 40건, 기밀/비기밀 균형)를 추가로 병합
 
-v6와 동일한 파이프라인(80/20 stratified split, KoELECTRA fine-tuning)을 사용한다.
+학습/검증/최종 테스트를 60/20/20 stratified split으로 분리한다.
 
 실행 환경: Google Colab (GPU: T4 권장)
-사전 설치: !pip install -q transformers datasets scikit-learn accelerate torch
+사전 설치: !pip install -q "transformers>=4.41,<5" datasets scikit-learn accelerate torch
 """
 
 import os
@@ -34,10 +34,12 @@ from transformers import (
 # ------------------------------------------------------------------
 SEED = 42
 MODEL_NAME = "monologg/koelectra-base-v3-discriminator"
+MODEL_VERSION = "koelectra-dlp-v7"
 DATA_PATH = "data/train_dataset_v6.csv"     # 추적된 구어체 보강판 (223건)
 OUTPUT_DIR = "./koelectra-dlp-v7"
 MAX_LENGTH = 128
 TEST_SIZE = 0.2
+VALIDATION_SIZE = 0.2
 NUM_EPOCHS = 8
 BATCH_SIZE = 8
 LEARNING_RATE = 2e-5
@@ -58,16 +60,26 @@ df["label"] = df["label"].astype(int)
 
 print(f"[INFO] 전체 데이터: {len(df)}건 | label 분포: {df['label'].value_counts().to_dict()}")
 
-train_df, test_df = train_test_split(
+train_validation_df, test_df = train_test_split(
     df, test_size=TEST_SIZE, stratify=df["label"], random_state=SEED
 )
+relative_validation_size = VALIDATION_SIZE / (1 - TEST_SIZE)
+train_df, validation_df = train_test_split(
+    train_validation_df,
+    test_size=relative_validation_size,
+    stratify=train_validation_df["label"],
+    random_state=SEED,
+)
 train_df = train_df.reset_index(drop=True)
+validation_df = validation_df.reset_index(drop=True)
 test_df = test_df.reset_index(drop=True)
 
 train_df.to_csv("train_split_v7.csv", index=False, encoding="utf-8-sig")
+validation_df.to_csv("validation_split_v7.csv", index=False, encoding="utf-8-sig")
 test_df.to_csv("test_split_v7.csv", index=False, encoding="utf-8-sig")
 
 print(f"[INFO] Train: {len(train_df)}건 {train_df['label'].value_counts().to_dict()}")
+print(f"[INFO] Validation: {len(validation_df)}건 {validation_df['label'].value_counts().to_dict()}")
 print(f"[INFO] Test : {len(test_df)}건 {test_df['label'].value_counts().to_dict()}")
 
 # ------------------------------------------------------------------
@@ -81,19 +93,26 @@ def tokenize_fn(batch):
     )
 
 train_ds = Dataset.from_pandas(train_df[["text", "label"]])
+validation_ds = Dataset.from_pandas(validation_df[["text", "label"]])
 test_ds = Dataset.from_pandas(test_df[["text", "label"]])
 train_ds = train_ds.map(tokenize_fn, batched=True)
+validation_ds = validation_ds.map(tokenize_fn, batched=True)
 test_ds = test_ds.map(tokenize_fn, batched=True)
 train_ds = train_ds.rename_column("label", "labels")
+validation_ds = validation_ds.rename_column("label", "labels")
 test_ds = test_ds.rename_column("label", "labels")
 cols = ["input_ids", "attention_mask", "labels"]
 train_ds.set_format(type="torch", columns=cols)
+validation_ds.set_format(type="torch", columns=cols)
 test_ds.set_format(type="torch", columns=cols)
 
 # ------------------------------------------------------------------
 # 3. 모델 로드
 # ------------------------------------------------------------------
 model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=2).to(device)
+model.config.sentry_model_version = MODEL_VERSION
+model.config.id2label = {0: "non_sensitive", 1: "sensitive"}
+model.config.label2id = {"non_sensitive": 0, "sensitive": 1}
 
 # ------------------------------------------------------------------
 # 4. 평가 지표 함수
@@ -136,7 +155,7 @@ training_args = TrainingArguments(
 
 trainer = Trainer(
     model=model, args=training_args,
-    train_dataset=train_ds, eval_dataset=test_ds,
+    train_dataset=train_ds, eval_dataset=validation_ds,
     compute_metrics=compute_metrics,
     callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
 )
@@ -174,7 +193,8 @@ for k, v in final_metrics.items():
 
 result_summary = {
     "metrics": final_metrics, "confusion_matrix": cm.tolist(),
-    "test_size": len(test_df), "train_size": len(train_df),
+    "test_size": len(test_df), "validation_size": len(validation_df),
+    "train_size": len(train_df),
     "model_name": MODEL_NAME,
     "hyperparams": {"epochs": NUM_EPOCHS, "batch_size": BATCH_SIZE,
                     "learning_rate": LEARNING_RATE, "max_length": MAX_LENGTH},
@@ -186,6 +206,16 @@ test_df_out = test_df.copy()
 test_df_out["pred"] = preds
 test_df_out["prob_sensitive"] = probs
 test_df_out.to_csv("test_predictions_v7.csv", index=False, encoding="utf-8-sig")
+
+validation_output = trainer.predict(validation_ds)
+validation_df_out = validation_df.copy()
+validation_df_out["pred"] = np.argmax(validation_output.predictions, axis=1)
+validation_df_out["prob_sensitive"] = torch.softmax(
+    torch.tensor(validation_output.predictions), dim=1
+).numpy()[:, 1]
+validation_df_out.to_csv(
+    "validation_predictions_v7.csv", index=False, encoding="utf-8-sig"
+)
 
 # ------------------------------------------------------------------
 # 8. 모델 저장

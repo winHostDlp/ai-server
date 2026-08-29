@@ -10,7 +10,7 @@ train_koelectra_v6.py
 실행 환경: Google Colab (GPU: T4 권장)
 
 사전 설치 (Colab 셀 최상단에서 실행):
-    !pip install -q transformers datasets scikit-learn accelerate torch
+    !pip install -q "transformers>=4.41,<5" datasets scikit-learn accelerate torch
 """
 
 import os
