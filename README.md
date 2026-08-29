@@ -137,6 +137,62 @@ os.environ["AI_BASE_URL"] = "https://<현재-주소>.trycloudflare.com"
 
 `batch_test_live_api.py`는 추적 파일을 수정하지 않고 `AI_BASE_URL` 환경변수의 현재 HTTPS 도메인을 사용하며, 주소가 없거나 경로까지 포함되면 패키지 설치 전에 중단합니다. 이 스크립트는 v6 학습 데이터와 하드케이스를 대상으로 응답의 `event_id`, 점수-판정 경계, `koelectra-dlp-v7`, 지연시간 계약까지 확인한 뒤 정상 건만 성공 집계합니다. 401·422와 응답 계약 위반은 재호출하지 않으며, 재시도는 일시적인 통신 오류와 408/425/429/5xx에만 적용합니다. 이 배치에는 학습 데이터가 포함되므로 **held-out 모델 품질 증거로 사용하지 않습니다.**
 
+### Blind OOD 최종 평가 게이트
+
+`eval_ood_final.py`는 threshold 선택이 끝난 뒤 독립 보관한 OOD를 라이브
+`/api/v1/analyze`에 단 한 번 보내 최종 일반화 성능을 고정하는 용도입니다.
+순서는 반드시 다음과 같습니다.
+
+1. 학습·Validation·hard-case 분석을 마치고 사용할 v7 checkpoint와
+   `block_threshold` / `review_threshold`를 먼저 동결합니다.
+2. 서버 실행 전에 `SENTRY_MODEL_PATH`를 명시합니다. 평가 담당자가 저장소 밖에
+   보관한 OOD CSV와 그 경로의 실제 weights 파일 SHA-256을 계산해 외부 lock
+   manifest에 기록합니다. OOD 실제 행 수를 `expected_rows`에 고정하고
+   품질 합격선 `minimum_f1` / `minimum_recall`도 결과를 보기 전에 고정한 뒤
+   `status`를 `locked`로 바꿉니다. F1 90% 이상·Recall 우선 목표가 무력화되지
+   않도록 두 합격선 모두 0.90 이상 1 이하만 허용합니다.
+3. 같은 Colab 런타임에서 라이브 서버를 연 뒤 아래 명령을 한 번 실행합니다.
+4. 생성된 aggregate JSON의 SHA-256과 precision/recall/F1/confusion을
+   공개합니다. OOD 원문·행별 예측은 공개하지 않습니다.
+5. 결과를 본 뒤 checkpoint, threshold, 데이터 또는 전처리를 다시 고르지
+   않습니다. 바꾸면 기존 OOD는 튜닝 데이터가 된 것이므로 새 독립 OOD로
+   처음부터 다시 평가해야 합니다.
+
+추적된 `ood_eval_manifest.example.json`은 의도적으로 hash와 threshold가 비어
+있고 `locked`가 아니므로 그대로는 항상 실패합니다. 완성 manifest와 OOD CSV는
+Git에 추가하지 않습니다. OOD CSV 헤더는 정확히
+`case_id,text,label,domain,style`이어야 하며 label 0/1 수가 같아야 합니다.
+최소 16행·4개 domain이 필요하고, 각 domain에는 최소 2개 style, 각
+domain×style 조합에는 label 0/1이 모두 있어야 합니다. 실제 총 행 수는
+manifest의 `expected_rows`와 정확히 일치해야 합니다.
+스크립트는 내부 중복과 추적된 `train_dataset_v6.csv` /
+`hard_test_set_v1.csv`의 정규화 exact-overlap도 네트워크 호출 전에 거절합니다.
+
+```bash
+export AI_BASE_URL="https://<현재-주소>.trycloudflare.com"
+# AI_API_TOKEN은 server.py를 연 값과 동일하게 이미 설정되어 있어야 합니다.
+python eval_ood_final.py \
+  --manifest /content/drive/MyDrive/private/ood_eval_lock_v1.json \
+  --ood-csv /content/drive/MyDrive/private/ood_final_v1.csv \
+  --checkpoint-file "${SENTRY_MODEL_PATH:?server.py 실행 전에 설정}/model.safetensors" \
+  --output /content/drive/MyDrive/private/ood_eval_result_v7.json
+```
+
+`--checkpoint-file`은 실행 중인 서버의 `SENTRY_MODEL_PATH`가 실제로 읽은 weights
+파일을 가리켜야 합니다. evaluator는 그 파일과 OOD CSV의 SHA-256, 루트 health의
+checkpoint SHA-256·v7·두 threshold, 모든 분석 응답 계약을 함께 확인합니다.
+서버는 모호한 checkpoint 선택을 피하기 위해 해당 경로에 단일
+`model.safetensors` 또는 `pytorch_model.bin`이 있을 때만 준비 상태가 됩니다.
+`.bin` checkpoint이면 명령의 파일명도 `pytorch_model.bin`으로 바꿉니다.
+양성 예측은 고정한 `block_threshold` 이상으로 정의합니다. 통신 오류나 응답
+계약 오류가 한 건이라도 있으면 metrics를 `null`, 전체 `status`를 `invalid`로
+기록합니다. 전체 응답이 유효하면 F1과 Recall이 두 합격선을 모두 충족할 때만
+`status=passed`, `quality_passed=true`, 종료 코드 0입니다. 하나라도 미달이면
+metrics와 confusion을 보존한 채 `status=quality_failed`,
+`quality_passed=false`, 종료 코드 2입니다. 결과 파일은 새 파일로만 생성하므로 같은
+출력에 덮어써서 1회 평가 기록을 바꿀 수 없습니다. 최종 원자적 교체가 실패하면
+선점한 `invalid` 결과와 복구 가능한 임시 JSON을 삭제하지 않습니다.
+
 ## 7. 현재 발표 통합 토폴로지
 
 실제 Windows 시연에서는 Host Agent가 AI 판정과 대시보드 기록을 서로 다른

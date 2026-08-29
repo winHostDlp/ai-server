@@ -1,0 +1,11 @@
+{
+  "status": "EXAMPLE_NOT_LOCKED",
+  "model_version": "koelectra-dlp-v7",
+  "checkpoint_sha256": "",
+  "ood_csv_sha256": "",
+  "block_threshold": null,
+  "review_threshold": null,
+  "minimum_f1": null,
+  "minimum_recall": null,
+  "expected_rows": null
+}

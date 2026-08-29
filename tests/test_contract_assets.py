@@ -220,6 +220,24 @@ def test_model_checkpoint_identity_is_verified_before_serving() -> None:
     assert "torch.isfinite(warmup_logits).all().item()" in server
     assert "model.config.sentry_model_version = MODEL_VERSION" in train
     assert 'model.config.id2label = {0: "non_sensitive", 1: "sensitive"}' in train
+    assert '"checkpoint_sha256": CHECKPOINT_SHA256' in server
+
+
+def test_model_checkpoint_weight_file_selection_is_unambiguous(tmp_path: Path) -> None:
+    resolve = _load_function(
+        "server.py",
+        "resolve_model_weights",
+        {"os": os, "RuntimeError": RuntimeError},
+    )
+
+    with pytest.raises(RuntimeError):
+        resolve(str(tmp_path))
+    safetensors = tmp_path / "model.safetensors"
+    safetensors.write_bytes(b"test-only")
+    assert resolve(str(tmp_path)) == str(safetensors)
+    (tmp_path / "pytorch_model.bin").write_bytes(b"test-only")
+    with pytest.raises(RuntimeError):
+        resolve(str(tmp_path))
 
 
 def test_cloudflared_is_pinned_verified_and_runtime_cleanup_is_scoped() -> None:

@@ -64,6 +64,17 @@ def sha256_file(path: str) -> str:
     return digest.hexdigest()
 
 
+def resolve_model_weights(model_path: str) -> str:
+    candidates = (
+        os.path.join(model_path, "model.safetensors"),
+        os.path.join(model_path, "pytorch_model.bin"),
+    )
+    existing = [path for path in candidates if os.path.isfile(path)]
+    if len(existing) != 1:
+        raise RuntimeError("단일 v7 model.safetensors 또는 pytorch_model.bin이 필요합니다.")
+    return existing[0]
+
+
 def ensure_cloudflared() -> None:
     if os.path.exists(CLOUDFLARED_PATH) and sha256_file(CLOUDFLARED_PATH) == CLOUDFLARED_SHA256:
         os.chmod(CLOUDFLARED_PATH, 0o755)
@@ -296,11 +307,13 @@ print(f"⏳ 2. AI 판별 엔진 가중치 로드 중... ({MODEL_PATH})")
 model_loaded = False
 model = None
 tokenizer = None
+CHECKPOINT_SHA256 = None
 
 try:
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
     model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH).to(DEVICE)
     validate_model_config(model)
+    CHECKPOINT_SHA256 = sha256_file(resolve_model_weights(MODEL_PATH))
     model.eval()
     warmup_inputs = tokenizer(
         "DLP 모델 준비 상태 확인",
@@ -407,6 +420,7 @@ def health_check():
         "device": DEVICE,
         "block_threshold": BLOCK_THRESHOLD,
         "review_threshold": REVIEW_THRESHOLD,
+        "checkpoint_sha256": CHECKPOINT_SHA256,
         "auth_required": True,
     }
 
