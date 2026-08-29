@@ -9,20 +9,38 @@
 ```
 POST {BASE_URL}/api/v1/analyze
 Content-Type: application/json
+Authorization: Bearer {AI_API_TOKEN}
 ```
 
 주의: `{BASE_URL}`은 Colab 세션마다 바뀝니다. (Cloudflare Tunnel 무료 플랜은 고정 도메인 미지원)
+
+Cloudflare 주소는 공개 인터넷에 열리므로 서버 실행 전 최소 32자의 ASCII 무작위 토큰을 환경변수로 설정합니다. 짧거나 비ASCII인 토큰이면 패키지 설치·모델 로드·터널 실행 전에 중단합니다.
+
+```python
+import os
+import secrets
+
+os.environ["AI_API_TOKEN"] = secrets.token_urlsafe(32)
+# 필요한 경우만 기본 Colab Drive 경로를 덮어씁니다.
+# os.environ["SENTRY_MODEL_PATH"] = "/content/drive/MyDrive/.../koelectra-dlp-v7/final"
+```
+
+같은 `AI_API_TOKEN`을 Host의 환경변수 또는 Git에서 제외된 `config/settings.local.yaml`의 `server.ai_token`, Web의 `AI_SERVER_TOKEN`에 설정하되 추적 설정·Git·채팅·발표 화면에 값을 남기지 않습니다. Host 환경변수가 local YAML보다 우선합니다.
+
+`server.py`는 **Google Colab의 Linux amd64 런타임 전용**이며, Colab 셀 붙여넣기와 그 런타임 안의 `python server.py` 실행을 지원합니다. macOS·Windows·ARM·일반 로컬 Python 실행 지원을 뜻하지 않습니다. 독립 실행은 `Ctrl+C`까지 유지되고, Colab에서 셀을 다시 실행할 때는 그 셀이 앞서 만든 서버·터널만 종료합니다. 터널이 예기치 않게 종료되면 연결이 끊긴 로컬 API도 중단하며, 다른 `cloudflared` 프로세스는 광역 종료하지 않습니다. 내려받는 `cloudflared`는 `2026.8.2` Linux amd64와 공식 SHA-256으로 고정·검증합니다. FastAPI·Uvicorn·Pydantic·PyTorch·Transformers는 코드가 전제한 호환 메이저 범위로 설치해 기존 Pydantic v1 환경을 그대로 사용하지 않습니다.
 
 ## 2. Request
 
 | 필드 | 타입 | 필수 | 설명 |
 |---|---|---|---|
-| `event_id` | string | O | Host Agent가 발급하는 이벤트 고유 ID |
-| `channel` | string | O | `clipboard` / `outlook` / `http` / `usb` 등 반출 채널 |
-| `user_id` | string | O | 사용자/디바이스 식별자 |
-| `matched_patterns` | string[] | X | 1차 Rule 필터에서 매칭된 패턴 ID (없으면 빈 배열) |
-| `snippet` | string | O | 분석할 텍스트 (PII는 사전에 마스킹 권장) |
-| `metadata` | object | X | `app`, `dest`, `severity_hint` 포함 가능 |
+| `event_id` | string | O | 1~120자. Host Agent가 발급하는 이벤트 고유 ID |
+| `channel` | string | O | Host/Web 계약의 `clipboard`, `outlook`, `smtp`, `web_mail`, `drive_upload`, `file_guard`, `http`, `usb`, `web_upload`, `email_attachment`, `print`, `messenger` 중 하나 |
+| `user_id` | string | O | 1~100자. 사용자/디바이스 식별자 |
+| `matched_patterns` | string[] | X | 최대 100개, 각 1~100자. 1차 Rule 필터 패턴 ID |
+| `snippet` | string | O | 1~4000자. 분석할 텍스트 |
+| `metadata` | object | X | 최대 50개 항목. 키 1~100자, 문자열 값 최대 500자, 수치는 유한값만 허용 |
+
+모델 문맥을 위해 Host가 `snippet` 원문을 전송하므로 실제 개인정보·운영 비밀은 시연에 사용하지 않습니다. AI 서버 JSONL에는 snippet 원문/미리보기 대신 길이만, `user_id` 대신 SHA-256 기반 가명값만 기록합니다.
 
 ### Request 예시
 ```json
@@ -49,7 +67,7 @@ Content-Type: application/json
 | `confidence_score` | float | 0.0 ~ 1.0, 기밀일 확률 |
 | `model_version` | string | 현재: `koelectra-dlp-v7` |
 | `latency_ms` | float | AI 서버 내부 추론 소요 시간(ms) |
-| `reason` | string | 확장 필드 (공식 스키마엔 없음), 판정 사유 요약 |
+| `reason` | string | 판정 사유 요약 |
 
 ### Response 예시
 ```json
@@ -71,15 +89,17 @@ Content-Type: application/json
 | 0.20 이상 0.41 미만 | review |
 | < 0.20 | allow |
 
-v7(구어체 보강 재학습) 기준 ROC/PR curve 재검증 결과. 격식체 하드케이스 50건 + 신규 구어체 하드케이스 34건 + 정식 Test셋으로 검증. 모델 재학습 시 threshold도 재산정 필요.
+`server.py`에 적용된 현재 값입니다. 저장소에는 v7 모델 가중치·실행 산출물이 없으므로 `train_koelectra_v7.py` → `eval_hard_cases.py` → `threshold_analysis.py`를 같은 checkpoint로 재실행하고 생성된 `test_predictions_v7.csv`, `hard_test_results_v7.csv`, `threshold_candidates.csv`를 검토하기 전에는 0.41/0.20을 재현 검증 완료로 표현하지 않습니다. 모델 재학습 시 threshold도 다시 산정합니다.
 
 ## 5. 에러 응답
 
 | status code | 상황 |
 |---|---|
+| 401 | Bearer 토큰 누락 또는 불일치 |
 | 400 | `snippet`이 비어있음 |
+| 422 | 요청 스키마 검증 실패 |
 | 503 | AI 모델이 로드되지 않은 상태 (서버 기동 직후 등) |
-| 500 | 추론 중 내부 에러 (`detail` 필드 참고) |
+| 500 | 추론 중 내부 오류. 응답과 JSONL에는 내부 예외 문자열을 노출하지 않음 |
 
 Host Agent는 착수보고서 3.5절 Fail-Open 정책(AI 서버 무응답/에러 시 기본 허용)을 따르므로, 위 에러 상황에서도 서비스가 멈추지 않도록 타임아웃/재시도 로직 권장.
 
@@ -88,6 +108,7 @@ Host Agent는 착수보고서 3.5절 Fail-Open 정책(AI 서버 무응답/에러
 ```bash
 curl -X POST {BASE_URL}/api/v1/analyze \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer {AI_API_TOKEN}" \
   -d '{
     "event_id": "test-001",
     "channel": "clipboard",
@@ -100,6 +121,8 @@ curl -X POST {BASE_URL}/api/v1/analyze \
 
 Swagger UI: `{BASE_URL}/docs`
 
+토큰만 확인할 때는 추론·이벤트 로그를 만들지 않는 `GET {BASE_URL}/api/v1/agent-check`에 같은 Bearer 헤더를 사용합니다. `batch_test_live_api.py`는 v6 학습 데이터와 하드케이스를 대상으로 응답의 `event_id`, 점수-판정 경계, `koelectra-dlp-v7`, 지연시간 계약까지 확인한 뒤 정상 건만 성공 집계합니다. 401·422와 응답 계약 위반은 재호출하지 않으며, 재시도는 일시적인 통신 오류와 408/425/429/5xx에만 적용합니다. 이 배치에는 학습 데이터가 포함되므로 **held-out 모델 품질 증거로 사용하지 않습니다.**
+
 ## 7. 현재 발표 통합 토폴로지
 
 실제 Windows 시연에서는 Host Agent가 AI 판정과 대시보드 기록을 서로 다른
@@ -111,7 +134,7 @@ Windows Host Agent
   └─ POST {DASHBOARD_URL}/api/v1/logs ──> Web 서버·SQLite·대시보드
 ```
 
-- `AI_BASE_URL`은 AI Model 담당이 실행한 Colab/Cloudflare 주소입니다.
+- `AI_BASE_URL`은 AI Model 담당이 실행한 Colab/Cloudflare 주소이며 Host는 같은 `AI_API_TOKEN`을 Bearer 헤더로 보냅니다.
 - `DASHBOARD_URL`은 Web 담당 컴퓨터에서 LAN으로 연 Web 서버 주소입니다.
 - Web의 `/api/v1/analyze` 중계 기능은 별도 테스트 경로이며, 위 실제 Host 시연의
   기본 경로로 간주하지 않습니다.
@@ -137,7 +160,7 @@ Host Agent의 실제 채널은 원문에서 설정된 정규식 패턴이 한 �
 
 | 발표 동작 | Host AI 채널 | 대시보드 채널 | 실제 검증 조건 |
 |---|---|---|---|
-| USB로 테스트 파일 복사 | `file_guard` | `USB_COPY` | Windows 이동식 드라이브와 파일 생성 감시 필요 |
+| USB로 테스트 파일 복사 | `file_guard` | `USB_COPY` | Windows가 `DRIVE_REMOVABLE`로 보고하는 플래시 드라이브 필요; FIXED 외장 SSD는 제외 |
 | 브라우저·메신저 입력창에 붙여넣기 | `clipboard` | `CLIPBOARD` | Windows 키보드/클립보드 훅과 실제 `Ctrl+V` 필요 |
 | Outlook 외부 메일 전송 | `outlook` | `EMAIL_ATTACHMENT` | Outlook 설치·로그인과 COM `ItemSend` 필요 |
 | 웹메일 본문·첨부 전송 | `web_mail` | `WEB_UPLOAD` | HTTPS 프록시, 테스트 브라우저와 웹메일 계정 필요 |
@@ -154,12 +177,12 @@ Host Agent의 실제 채널은 원문에서 설정된 정규식 패턴이 한 �
 Host의 `demo_preflight.py` 통과는 설정과 실행 전제 조건을 점검한 발표 준비도
 증거일 뿐, 라이브 v7 호출이나 E2E 완료 증거가 아닙니다. 실제 채널 이벤트로
 동일한 `event_id`의 전 경로와 운영체제·애플리케이션 조치까지 따로 확인해야 합니다.
-Web R009의 보호 API로 대시보드 토큰 일치까지 확인하지만, 실행 중인 Windows
-훅과 실제 조치 성공 여부를 대신 증명하지는 않습니다. R009 사전 점검은
+Web의 보호 API로 대시보드 토큰 일치까지 확인하지만, 실행 중인 Windows
+훅과 실제 조치 성공 여부를 대신 증명하지는 않습니다. 현재 사전 점검은
 `SentryUserAgent` 실행 상태, WebProxy TCP 리스너와 QUIC 차단 규칙도 확인하지만,
 실제 Outlook·USB·Clipboard·브라우저 트래픽 발생 증거는 아닙니다.
 
-- [ ] AI 서버 루트 헬스 응답의 `status`가 `running`이다.
+- [ ] AI 서버 루트 헬스 응답의 `status`가 `running`이고 보호된 `/api/v1/agent-check`가 토큰을 승인한다.
 - [ ] Host 사전 점검에서 `SentryUserAgent`, WebProxy 리스너, QUIC 차단 규칙과
   5개 시나리오가 모두 `PASS`이다.
 - [ ] 각 AI 응답과 대시보드 상세의 `model_version`이

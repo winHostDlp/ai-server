@@ -2,38 +2,104 @@
 # Sentry AI DLP 서버 (v8 - Colab 셀 붙여넣기 최종본)
 # =====================================================================
 print("⏳ 1. 필수 패키지 및 Cloudflare 터널링 도구 설치 중...")
-!pip install -q fastapi uvicorn pydantic torch transformers
-
 import os
+import sys
 import time
 import re
 import json
+import hashlib
+import queue
+import secrets
 import threading
 import subprocess
 import traceback
+import urllib.request
 from datetime import datetime, timezone
-from typing import Optional, Literal, List
+from typing import Annotated, Literal, Optional
 
-# 드라이브(FUSE 마운트)는 chmod +x가 제대로 안 먹으므로 /content에 받습니다
+AI_API_TOKEN = os.environ.get("AI_API_TOKEN", "").strip()
+try:
+    AI_API_TOKEN_BYTES = AI_API_TOKEN.encode("ascii")
+except UnicodeEncodeError as exc:
+    raise RuntimeError("AI_API_TOKEN은 ASCII 무작위 문자열이어야 합니다.") from exc
+if len(AI_API_TOKEN_BYTES) < 32:
+    raise RuntimeError(
+        "AI_API_TOKEN을 32자 이상의 ASCII 무작위 환경변수로 설정하세요. "
+        "Cloudflare 공개 터널은 인증 없이 열지 않습니다."
+    )
+
+subprocess.run(
+    [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "-q",
+        "fastapi>=0.100,<1",
+        "uvicorn>=0.23,<1",
+        "pydantic>=2,<3",
+        "torch>=2,<3",
+        "transformers>=4.30,<5",
+    ],
+    check=True,
+)
+
+# 드라이브(FUSE 마운트)는 chmod +x가 제대로 안 먹으므로 /content에 받습니다.
+# 공식 release의 버전과 SHA-256을 함께 고정해 임의 최신 바이너리를 실행하지 않습니다.
 CLOUDFLARED_PATH = "/content/cloudflared-linux-amd64"
-if not os.path.exists(CLOUDFLARED_PATH):
-    !wget -q -O {CLOUDFLARED_PATH} https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-!chmod +x {CLOUDFLARED_PATH}
+CLOUDFLARED_VERSION = "2026.8.2"
+CLOUDFLARED_SHA256 = "fcfb02b575a52ca1af2e3267af4e1517bcdeb30ac48c834c69abaed3c0576ad2"
+CLOUDFLARED_URL = (
+    "https://github.com/cloudflare/cloudflared/releases/download/"
+    f"{CLOUDFLARED_VERSION}/cloudflared-linux-amd64"
+)
+
+
+def sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as file_obj:
+        for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def ensure_cloudflared() -> None:
+    if os.path.exists(CLOUDFLARED_PATH) and sha256_file(CLOUDFLARED_PATH) == CLOUDFLARED_SHA256:
+        os.chmod(CLOUDFLARED_PATH, 0o755)
+        return
+
+    download_path = CLOUDFLARED_PATH + ".download"
+    try:
+        urllib.request.urlretrieve(CLOUDFLARED_URL, download_path)
+        actual_sha256 = sha256_file(download_path)
+        if not secrets.compare_digest(actual_sha256, CLOUDFLARED_SHA256):
+            raise RuntimeError("cloudflared SHA-256 검증에 실패했습니다.")
+        os.replace(download_path, CLOUDFLARED_PATH)
+        os.chmod(CLOUDFLARED_PATH, 0o755)
+    finally:
+        if os.path.exists(download_path):
+            os.remove(download_path)
+
 
 import torch
 import torch.nn.functional as F
 import uvicorn
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import Depends, FastAPI, Header, HTTPException
+from pydantic import BaseModel, ConfigDict, Field
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 # =====================================================================
 # 2. 설정값
 # =====================================================================
-MODEL_PATH = "/content/drive/MyDrive/2026_졸업과제/도메인편향개선2/koelectra-dlp-v7/final"
+MODEL_PATH = os.environ.get(
+    "SENTRY_MODEL_PATH",
+    "/content/drive/MyDrive/2026_졸업과제/도메인편향개선2/koelectra-dlp-v7/final",
+)
 MODEL_VERSION = "koelectra-dlp-v7"
-BLOCK_THRESHOLD = 0.41   # v7 재검증: Youden's J / F1 공통 최적값 (precision 유지하며 recall 0.939->0.970 개선)
-REVIEW_THRESHOLD = 0.20  # v7 재검증: 비기밀 allow율 손해 없이 기밀 recall 개선 확인된 값
+# 현재 배포 설정. 저장소에 가중치·평가 산출물이 포함되지 않으므로
+# eval_hard_cases.py와 threshold_analysis.py를 재실행하기 전에는 재현 검증 완료로 표현하지 않는다.
+BLOCK_THRESHOLD = 0.41
+REVIEW_THRESHOLD = 0.20
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -41,7 +107,10 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # 2-1. 요청/응답 로깅 설정
 # =====================================================================
 # 드라이브에 저장해서 Colab 세션이 끊겨도 로그가 남도록 함
-LOG_DIR = "/content/drive/MyDrive/2026_졸업과제/도메인편향개선2/logs"
+LOG_DIR = os.environ.get(
+    "SENTRY_LOG_DIR",
+    "/content/drive/MyDrive/2026_졸업과제/도메인편향개선2/logs",
+)
 LOG_PATH = os.path.join(LOG_DIR, "analyze_log.jsonl")
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -56,44 +125,53 @@ def log_event(record: dict) -> None:
         traceback.print_exc()
 
 
-def read_recent_logs(limit: int = 20) -> list:
-    """최근 N건의 로그를 최신순으로 반환."""
-    if not os.path.exists(LOG_PATH):
-        return []
-    with open(LOG_PATH, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    recent = lines[-limit:]
-    logs = []
-    for line in reversed(recent):
-        try:
-            logs.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return logs
+def pseudonymize_user_id(user_id: str) -> str:
+    """로그에 사용자 식별자 원문을 남기지 않는다."""
+    return hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:16]
+
 
 # =====================================================================
 # 3. 요청/응답 스키마 (중간보고서 2.2절 공식 스키마 기준)
 # =====================================================================
-class Metadata(BaseModel):
-    app: Optional[str] = None
-    dest: Optional[str] = None
-    severity_hint: Optional[str] = None
+ShortText = Annotated[str, Field(min_length=1, max_length=100)]
+MetadataKey = Annotated[str, Field(min_length=1, max_length=100)]
+MetadataString = Annotated[str, Field(max_length=500)]
+
 
 class AgentRequest(BaseModel):
-    event_id: str
-    channel: str
-    user_id: str
-    matched_patterns: List[str] = Field(default_factory=list)
-    snippet: str
-    metadata: Optional[Metadata] = None
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    event_id: str = Field(..., min_length=1, max_length=120)
+    channel: Literal[
+        "clipboard",
+        "outlook",
+        "smtp",
+        "web_mail",
+        "drive_upload",
+        "file_guard",
+        "http",
+        "usb",
+        "web_upload",
+        "email_attachment",
+        "print",
+        "messenger",
+    ]
+    user_id: str = Field(..., min_length=1, max_length=100)
+    matched_patterns: list[ShortText] = Field(default_factory=list, max_length=100)
+    snippet: str = Field(..., min_length=1, max_length=4000)
+    metadata: dict[
+        MetadataKey,
+        MetadataString | int | float | bool | None,
+    ] = Field(default_factory=dict, max_length=50)
+
 
 class AgentResponse(BaseModel):
-    event_id: str
+    event_id: str = Field(..., min_length=1, max_length=120)
     decision: Literal["allow", "review", "block"]
-    confidence_score: float
-    model_version: str
-    latency_ms: float
-    reason: Optional[str] = None
+    confidence_score: float = Field(..., ge=0.0, le=1.0)
+    model_version: str = Field(..., min_length=1, max_length=100)
+    latency_ms: float = Field(..., ge=0.0, le=600000.0)
+    reason: Optional[Annotated[str, Field(max_length=500)]] = None
 
 def to_decision(confidence_score: float) -> Literal["allow", "review", "block"]:
     if confidence_score >= BLOCK_THRESHOLD:
@@ -101,6 +179,22 @@ def to_decision(confidence_score: float) -> Literal["allow", "review", "block"]:
     elif confidence_score >= REVIEW_THRESHOLD:
         return "review"
     return "allow"
+
+
+def verify_ai_token(
+    authorization: Optional[str] = Header(default=None),
+) -> None:
+    scheme, _, provided_token = (authorization or "").partition(" ")
+    try:
+        provided_token_bytes = provided_token.encode("ascii")
+    except UnicodeEncodeError:
+        provided_token_bytes = b""
+    if (
+        scheme.lower() != "bearer"
+        or not provided_token
+        or not secrets.compare_digest(provided_token_bytes, AI_API_TOKEN_BYTES)
+    ):
+        raise HTTPException(status_code=401, detail="Invalid or missing AI token.")
 
 # =====================================================================
 # 4. FastAPI 앱 초기화 및 모델 로드
@@ -130,18 +224,19 @@ except Exception as e:
 # 5. 실시간 판별 API 핵심 로직
 # =====================================================================
 @app.post("/api/v1/analyze", response_model=AgentResponse)
-def analyze_text(request: AgentRequest):
+def analyze_text(request: AgentRequest, _: None = Depends(verify_ai_token)):
+    user_id_hash = pseudonymize_user_id(request.user_id)
     if not model_loaded:
         log_event({
             "event_id": request.event_id, "channel": request.channel,
-            "user_id": request.user_id, "status": "error",
+            "user_id_hash": user_id_hash, "status": "error",
             "error": "model_not_loaded",
         })
         raise HTTPException(status_code=503, detail="AI 모델이 로드되지 않았습니다. 서버 로그를 확인하세요.")
     if not request.snippet.strip():
         log_event({
             "event_id": request.event_id, "channel": request.channel,
-            "user_id": request.user_id, "status": "error",
+            "user_id_hash": user_id_hash, "status": "error",
             "error": "empty_snippet",
         })
         raise HTTPException(status_code=400, detail="분석할 콘텐츠(snippet)가 비어 있습니다.")
@@ -159,7 +254,7 @@ def analyze_text(request: AgentRequest):
         with torch.no_grad():
             outputs = model(**inputs)
             probs = F.softmax(outputs.logits, dim=-1)
-            confidence_score = probs[0][1].item()
+            confidence_score = round(probs[0][1].item(), 4)
 
         latency_ms = round((time.time() - start_time) * 1000, 2)
         decision = to_decision(confidence_score)
@@ -173,8 +268,8 @@ def analyze_text(request: AgentRequest):
         log_event({
             "event_id": request.event_id,
             "channel": request.channel,
-            "user_id": request.user_id,
-            "snippet_preview": request.snippet[:200],  # 앞 200자만 저장
+            "user_id_hash": user_id_hash,
+            "snippet_length": len(request.snippet),
             "matched_patterns": request.matched_patterns,
             "status": "ok",
             "decision": decision,
@@ -185,7 +280,7 @@ def analyze_text(request: AgentRequest):
         return AgentResponse(
             event_id=request.event_id,
             decision=decision,
-            confidence_score=round(confidence_score, 4),
+            confidence_score=confidence_score,
             model_version=MODEL_VERSION,
             latency_ms=latency_ms,
             reason=reason_map[decision],
@@ -196,10 +291,10 @@ def analyze_text(request: AgentRequest):
         traceback.print_exc()
         log_event({
             "event_id": request.event_id, "channel": request.channel,
-            "user_id": request.user_id, "status": "error",
-            "error": str(e),
+            "user_id_hash": user_id_hash, "status": "error",
+            "error_type": type(e).__name__,
         })
-        raise HTTPException(status_code=500, detail=f"AI 추론 엔진 내부 에러: {str(e)}")
+        raise HTTPException(status_code=500, detail="AI 추론 엔진 내부 오류.") from e
 
 @app.get("/")
 def health_check():
@@ -209,59 +304,182 @@ def health_check():
         "device": DEVICE,
         "block_threshold": BLOCK_THRESHOLD,
         "review_threshold": REVIEW_THRESHOLD,
+        "auth_required": True,
     }
 
 
-@app.get("/api/v1/debug/logs")
-def get_recent_logs(limit: int = 20):
-    """최근 로그 N건 반환."""
-    return {"count": min(limit, 200), "logs": read_recent_logs(min(limit, 200))}
+@app.get("/api/v1/agent-check")
+def agent_connection_check(_: None = Depends(verify_ai_token)):
+    """모델 추론을 실행하지 않고 Host/Web의 AI 토큰만 확인한다."""
+    return {"status": "ok", "ai_token": "accepted"}
 
 # =====================================================================
 # 6. Cloudflare 백그라운드 서버 가동
 # =====================================================================
-def run_server(server_obj):
+TUNNEL_TIMEOUT_SEC = 30
+
+
+def run_server(server_obj) -> None:
     server_obj.run()
 
-# 같은 커널에서 셀을 재실행해도 이전 서버(스레드)를 확실히 종료하고 재시작
-if "_server_thread" in globals() and _server_thread is not None and _server_thread.is_alive():
-    print("♻️  이전 서버 인스턴스를 종료합니다...")
-    _server.should_exit = True
-    _server_thread.join(timeout=5)
 
-os.system("pkill -9 -f cloudflared")
-time.sleep(1)
+def _stop_process(process_obj) -> None:
+    if process_obj is None or process_obj.poll() is not None:
+        return
+    process_obj.terminate()
+    try:
+        process_obj.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process_obj.kill()
+        process_obj.wait(timeout=5)
 
-_config = uvicorn.Config(app, host="127.0.0.1", port=8000, log_level="error")
-_server = uvicorn.Server(_config)
-_server_thread = threading.Thread(target=run_server, args=(_server,), daemon=True)
-_server_thread.start()
-time.sleep(2)
 
-print("\n🌐 Cloudflare 안전 터널을 뚫고 있습니다...")
-process = subprocess.Popen(
-    [CLOUDFLARED_PATH, "tunnel", "--url", "http://127.0.0.1:8000"],
-    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-)
+def _stop_runtime(server_obj, server_thread, tunnel_process) -> None:
+    if server_obj is not None:
+        server_obj.should_exit = True
+    _stop_process(tunnel_process)
+    if server_thread is not None and server_thread.is_alive():
+        server_thread.join(timeout=5)
 
-public_url = None
-start_wait = time.time()
-TUNNEL_TIMEOUT_SEC = 30
-for line in process.stdout:
-    if public_url or (time.time() - start_wait) > TUNNEL_TIMEOUT_SEC:
-        break
-    match = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", line)
-    if match:
-        public_url = match.group()
-        break
 
-if public_url:
-    print(f"\n=======================================================")
-    print(f"🎉 [최종 성공] Cloudflare 터널 연결 완료!")
+def _stop_previous_runtime() -> None:
+    previous_server = globals().get("_server")
+    previous_thread = globals().get("_server_thread")
+    previous_tunnel = globals().get("_tunnel_process")
+    if previous_server is not None or previous_tunnel is not None:
+        print("♻️  이 셀이 시작한 이전 서버와 터널을 종료합니다...")
+        _stop_runtime(previous_server, previous_thread, previous_tunnel)
+
+
+def _capture_tunnel_url(process_obj) -> Optional[str]:
+    if process_obj.stdout is None:
+        return None
+    output_queue: queue.Queue[Optional[str]] = queue.Queue()
+    capture_done = threading.Event()
+
+    def drain_output() -> None:
+        try:
+            for line in process_obj.stdout:
+                if not capture_done.is_set():
+                    output_queue.put(line)
+        finally:
+            if not capture_done.is_set():
+                output_queue.put(None)
+
+    threading.Thread(target=drain_output, name="cloudflared-output", daemon=True).start()
+    deadline = time.monotonic() + TUNNEL_TIMEOUT_SEC
+    try:
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            try:
+                line = output_queue.get(timeout=min(0.5, max(remaining, 0.01)))
+            except queue.Empty:
+                if process_obj.poll() is not None:
+                    return None
+                continue
+            if line is None:
+                return None
+            match = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", line)
+            if match:
+                return match.group()
+        return None
+    finally:
+        capture_done.set()
+
+
+def _watch_tunnel(process_obj, server_obj) -> None:
+    return_code = process_obj.wait()
+    if not server_obj.should_exit:
+        print(f"\n❌ Cloudflare 터널이 예기치 않게 종료되었습니다. (exit={return_code})")
+        server_obj.should_exit = True
+
+
+def _start_runtime():
+    ensure_cloudflared()
+    config = uvicorn.Config(app, host="127.0.0.1", port=8000, log_level="error")
+    server_obj = uvicorn.Server(config)
+    server_thread = threading.Thread(
+        target=run_server,
+        args=(server_obj,),
+        name="sentry-ai-uvicorn",
+        daemon=True,
+    )
+    tunnel_process = None
+    try:
+        server_thread.start()
+        deadline = time.monotonic() + 10
+        while not server_obj.started and time.monotonic() < deadline:
+            if not server_thread.is_alive():
+                raise RuntimeError("Uvicorn 서버가 시작 중 종료되었습니다.")
+            time.sleep(0.1)
+        if not server_obj.started:
+            raise RuntimeError("Uvicorn 서버 시작 시간이 초과되었습니다.")
+
+        print("\n🌐 Cloudflare 안전 터널을 뚫고 있습니다...")
+        tunnel_process = subprocess.Popen(
+            [CLOUDFLARED_PATH, "tunnel", "--url", "http://127.0.0.1:8000"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        public_url = _capture_tunnel_url(tunnel_process)
+        if not public_url:
+            raise RuntimeError("Cloudflare 터널 URL 확인 시간이 초과되었습니다.")
+        threading.Thread(
+            target=_watch_tunnel,
+            args=(tunnel_process, server_obj),
+            name="cloudflared-watchdog",
+            daemon=True,
+        ).start()
+        return server_obj, server_thread, tunnel_process, public_url
+    except Exception:
+        _stop_runtime(server_obj, server_thread, tunnel_process)
+        raise
+
+
+def _running_in_notebook() -> bool:
+    try:
+        from IPython import get_ipython
+    except ImportError:
+        return False
+    return get_ipython() is not None
+
+
+def main() -> None:
+    global _server, _server_thread, _tunnel_process
+
+    _stop_previous_runtime()
+    _server, _server_thread, _tunnel_process, public_url = _start_runtime()
+
+    print("\n=======================================================")
+    print("🎉 [최종 성공] Cloudflare 터널 연결 완료!")
     print(f"🔗 에이전트 연동 엔드포인트: {public_url}/api/v1/analyze")
     print(f"🔗 Swagger UI 웹 테스트  : {public_url}/docs")
-    print(f"=======================================================\n")
+    print("=======================================================\n")
     print(f"⚙️  현재 적용된 threshold: block>={BLOCK_THRESHOLD}, review>={REVIEW_THRESHOLD}")
-    print("👉 위 Swagger UI 주소를 클릭해서 새 스키마로 테스트해보세요! (이 셀은 여기서 끝나도 서버는 계속 돌아갑니다)")
-else:
-    print("❌ 터널 생성에 실패했거나 시간이 초과되었습니다. 코랩 세션을 다시 시작해주세요.")
+
+    if _running_in_notebook():
+        print("👉 Colab 셀이 끝나도 현재 커널에서 서버와 터널이 계속 실행됩니다.")
+        return
+
+    print("👉 서버 실행 중입니다. 종료하려면 Ctrl+C를 누르세요.")
+    tunnel_failed = False
+    try:
+        while _server_thread.is_alive():
+            if _tunnel_process.poll() is not None:
+                tunnel_failed = True
+                break
+            _server_thread.join(timeout=1)
+        if _tunnel_process.poll() is not None:
+            tunnel_failed = True
+    except KeyboardInterrupt:
+        print("\n🛑 서버 종료 요청을 받았습니다.")
+    finally:
+        _stop_runtime(_server, _server_thread, _tunnel_process)
+    if tunnel_failed:
+        raise RuntimeError("Cloudflare 터널이 종료되어 AI 서버도 중단했습니다.")
+
+
+if __name__ == "__main__":
+    main()

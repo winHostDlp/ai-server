@@ -2,7 +2,7 @@
 """
 eval_hard_cases.py
 
-train_koelectra_v6.py로 재학습한 모델(./koelectra-dlp-v6/final)을
+train_koelectra_v7.py로 재학습한 모델(./koelectra-dlp-v7/final)을
 하드케이스 검증셋(hard_test_set_v1.csv)에 돌려서, 진짜 문맥 이해력을
 검증합니다.
 
@@ -15,7 +15,7 @@ train_koelectra_v6.py로 재학습한 모델(./koelectra-dlp-v6/final)을
 문장들이므로, 여기서 정확도가 크게 떨어진다면 모델이 표면적 패턴에
 의존하고 있다는 신호입니다.
 
-실행 환경: train_koelectra_v6.py와 같은 폴더 (모델 저장 경로 동일)
+실행 환경: train_koelectra_v7.py와 같은 폴더 (모델 저장 경로 동일)
 """
 
 import pandas as pd
@@ -26,10 +26,10 @@ from sklearn.metrics import (
 )
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
-MODEL_DIR = "./koelectra-dlp-v6/final"
-HARD_SET_PATH = "hard_test_set_v1.csv"
+MODEL_DIR = "./koelectra-dlp-v7/final"
+HARD_SET_PATH = "data/hard_test_set_v1.csv"
 MAX_LENGTH = 128
-THRESHOLD = 0.75  # 대시보드에 현재 적용 중인 컷라인 (75.0점)과 동일한 기준
+THRESHOLD = 0.41  # server.py의 현재 block 컷라인
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -117,5 +117,5 @@ else:
 # ------------------------------------------------------------------
 # 7. 저장
 # ------------------------------------------------------------------
-df.to_csv("hard_test_results_v1.csv", index=False, encoding="utf-8-sig")
-print(f"\n[INFO] 상세 결과를 hard_test_results_v1.csv 로 저장했습니다.")
+df.to_csv("hard_test_results_v7.csv", index=False, encoding="utf-8-sig")
+print(f"\n[INFO] 상세 결과를 hard_test_results_v7.csv 로 저장했습니다.")

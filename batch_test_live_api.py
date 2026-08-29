@@ -2,10 +2,26 @@
 # 배치 테스트 (Colab 셀 붙여넣기용)
 # ※ fastapi 서버를 띄운 셀이 계속 돌아가는 상태에서, 새 셀에 이 코드를 붙여넣어 실행하세요.
 # =====================================================================
-!pip install -q requests
-
+import os
+import math
+import subprocess
+import sys
 import time
 import uuid
+
+AI_API_TOKEN = os.environ.get("AI_API_TOKEN", "").strip()
+try:
+    AI_API_TOKEN_BYTES = AI_API_TOKEN.encode("ascii")
+except UnicodeEncodeError as exc:
+    raise RuntimeError("AI_API_TOKEN은 ASCII 무작위 문자열이어야 합니다.") from exc
+if len(AI_API_TOKEN_BYTES) < 32:
+    raise RuntimeError("32자 이상의 ASCII AI_API_TOKEN 환경변수가 필요합니다.")
+
+subprocess.run(
+    [sys.executable, "-m", "pip", "install", "-q", "requests", "pandas"],
+    check=True,
+)
+
 import pandas as pd
 import requests
 
@@ -17,7 +33,7 @@ BASE_URL = "https://여기에-현재-cloudflare-URL을-붙여넣으세요.tryclo
 ANALYZE_ENDPOINT = f"{BASE_URL}/api/v1/analyze"
 
 # 드라이브 경로에 맞게 필요시 수정하세요
-TRAIN_DATA_PATH = "/content/drive/MyDrive/2026_졸업과제/도메인편향개선2/train_dataset_v5.csv"
+TRAIN_DATA_PATH = "/content/drive/MyDrive/2026_졸업과제/도메인편향개선2/train_dataset_v6.csv"
 HARD_DATA_PATH = "/content/drive/MyDrive/2026_졸업과제/도메인편향개선2/hard_test_set_v1.csv"
 
 REQUEST_TIMEOUT_SEC = 10
@@ -31,7 +47,7 @@ OUTPUT_CSV = "/content/drive/MyDrive/2026_졸업과제/도메인편향개선2/ba
 def load_datasets():
     frames = []
     train_df = pd.read_csv(TRAIN_DATA_PATH)[["text", "label"]].copy()
-    train_df["source"] = "train_dataset_v5"
+    train_df["source"] = "train_dataset_v6"
     train_df["case_type"] = "normal"
     frames.append(train_df)
 
@@ -49,14 +65,53 @@ def load_datasets():
 # 2. API 호출
 # =====================================================================
 _session = requests.Session()
+_session.headers.update({"Authorization": f"Bearer {AI_API_TOKEN}"})
+
+
+def validate_api_response(raw: object, expected_event_id: str) -> dict:
+    if not isinstance(raw, dict):
+        raise ValueError("response must be a JSON object")
+    if raw.get("event_id") != expected_event_id:
+        raise ValueError("response event_id mismatch")
+
+    decision = raw.get("decision")
+    if not isinstance(decision, str) or decision not in {"allow", "review", "block"}:
+        raise ValueError("invalid decision")
+
+    score = raw.get("confidence_score")
+    if isinstance(score, bool) or not isinstance(score, (int, float)):
+        raise ValueError("invalid confidence_score type")
+    score = float(score)
+    if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+        raise ValueError("confidence_score must be finite and between 0 and 1")
+    expected_decision = "block" if score >= 0.41 else "review" if score >= 0.20 else "allow"
+    if decision != expected_decision:
+        raise ValueError("decision does not match the returned score")
+
+    if raw.get("model_version") != "koelectra-dlp-v7":
+        raise ValueError("unexpected model_version")
+
+    latency = raw.get("latency_ms")
+    if isinstance(latency, bool) or not isinstance(latency, (int, float)):
+        raise ValueError("invalid latency_ms type")
+    latency = float(latency)
+    if not math.isfinite(latency) or not 0.0 <= latency <= 600000.0:
+        raise ValueError("latency_ms must be finite and between 0 and 600000")
+
+    reason = raw.get("reason")
+    if reason is not None and (not isinstance(reason, str) or len(reason) > 500):
+        raise ValueError("invalid reason")
+    return raw
+
 
 def call_api(text: str) -> dict:
+    event_id = f"batch-{uuid.uuid4().hex[:8]}"
     payload = {
-        "event_id": f"batch-{uuid.uuid4().hex[:8]}",
-        "channel": "batch_test",
+        "event_id": event_id,
+        "channel": "clipboard",
         "user_id": "batch-test-runner",
         "matched_patterns": [],
-        "snippet": text,
+        "snippet": str(text)[:4000],
         "metadata": {"app": "batch_test", "dest": "internal", "severity_hint": "n/a"},
     }
     last_error = None
@@ -64,11 +119,21 @@ def call_api(text: str) -> dict:
         try:
             resp = _session.post(ANALYZE_ENDPOINT, json=payload, timeout=REQUEST_TIMEOUT_SEC)
             if resp.status_code == 200:
-                return resp.json()
+                try:
+                    return validate_api_response(resp.json(), event_id)
+                except (TypeError, ValueError) as exc:
+                    return {
+                        "decision": None,
+                        "confidence_score": None,
+                        "error": f"응답 계약 위반: {exc}",
+                    }
             last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
+            if resp.status_code not in {408, 425, 429, 500, 502, 503, 504}:
+                break
         except requests.exceptions.RequestException as e:
             last_error = str(e)
-        time.sleep(0.5)
+        if attempt < RETRY_COUNT:
+            time.sleep(0.5)
     return {"decision": None, "confidence_score": None, "error": last_error}
 
 # =====================================================================
@@ -77,6 +142,7 @@ def call_api(text: str) -> dict:
 df = load_datasets()
 print(f"[INFO] 총 {len(df)}건 테스트 시작 -> {ANALYZE_ENDPOINT}")
 print(f"[INFO] label 분포: {df['label'].value_counts().to_dict()}")
+print("[주의] 학습 데이터가 포함된 연동 점검이며 held-out 모델 품질 증거가 아닙니다.")
 
 results = []
 for i, row in df.iterrows():
@@ -85,7 +151,9 @@ for i, row in df.iterrows():
         "text": row["text"], "label": row["label"], "source": row["source"],
         "case_type": row["case_type"], "decision": res.get("decision"),
         "confidence_score": res.get("confidence_score"),
-        "latency_ms": res.get("latency_ms"), "error": res.get("error"),
+        "latency_ms": res.get("latency_ms"), "event_id": res.get("event_id"),
+        "model_version": res.get("model_version"), "reason": res.get("reason"),
+        "error": res.get("error"),
     })
     if (i + 1) % 20 == 0 or (i + 1) == len(df):
         print(f"  ... {i + 1}/{len(df)} 처리 완료")

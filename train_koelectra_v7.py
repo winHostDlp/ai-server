@@ -34,7 +34,7 @@ from transformers import (
 # ------------------------------------------------------------------
 SEED = 42
 MODEL_NAME = "monologg/koelectra-base-v3-discriminator"
-DATA_PATH = "train_dataset_v6.csv"          # 구어체 보강판 (223건)
+DATA_PATH = "data/train_dataset_v6.csv"     # 추적된 구어체 보강판 (223건)
 OUTPUT_DIR = "./koelectra-dlp-v7"
 MAX_LENGTH = 128
 TEST_SIZE = 0.2

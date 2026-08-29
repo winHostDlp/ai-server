@@ -2,9 +2,9 @@
 """
 threshold_analysis.py
 
-목적: '75.0점 컷라인'의 수학적 근거를 마련하기 위한 ROC / PR 곡선 분석
-- 입력 1: test_predictions_v6.csv   (재학습 시 생성된 정식 Test셋 예측 결과)
-- 입력 2: hard_test_results_v1.csv  (하드케이스 검증셋 예측 결과)
+목적: v7 block/review 컷라인의 수학적 근거를 재검증하기 위한 ROC / PR 곡선 분석
+- 입력 1: test_predictions_v7.csv   (재학습 시 생성된 정식 Test셋 예측 결과)
+- 입력 2: hard_test_results_v7.csv  (하드케이스 검증셋 예측 결과)
   -> 둘을 합쳐서 분석해야 의미가 있습니다. 정식 Test셋만 쓰면 확률이
      0.99+/0.01- 로 양극단에 몰려 있어 곡선이 사실상 무의미합니다.
      하드케이스가 섞여야 "애매한 경계 구간"이 곡선에 반영됩니다.
@@ -13,7 +13,7 @@ threshold_analysis.py
 - threshold_analysis.png (ROC curve + PR curve, 후보 threshold 표시)
 - threshold_candidates.csv (여러 기준별 추천 threshold와 성능 비교표)
 
-실행 환경: Colab (train_koelectra_v6.py, eval_hard_cases.py와 같은 폴더)
+실행 환경: Colab (train_koelectra_v7.py, eval_hard_cases.py와 같은 폴더)
 """
 
 import numpy as np
@@ -24,9 +24,10 @@ from sklearn.metrics import (
     precision_score, recall_score, f1_score
 )
 
-TEST_PRED_PATH = "test_predictions_v6.csv"
-HARD_PRED_PATH = "hard_test_results_v1.csv"
-CURRENT_THRESHOLD = 0.75  # 대시보드에 현재 적용 중인 컷라인
+TEST_PRED_PATH = "test_predictions_v7.csv"
+HARD_PRED_PATH = "hard_test_results_v7.csv"
+CURRENT_THRESHOLD = 0.41
+REVIEW_THRESHOLD = 0.20
 OUTPUT_PNG = "threshold_analysis.png"
 OUTPUT_CSV = "threshold_candidates.csv"
 
@@ -97,7 +98,8 @@ def eval_at(th):
     }
 
 candidates = pd.DataFrame([
-    {"criterion": "현재 적용값 (75.0점)", **eval_at(CURRENT_THRESHOLD)},
+    {"criterion": "현재 block 적용값 (0.41)", **eval_at(CURRENT_THRESHOLD)},
+    {"criterion": "현재 review 경계값 (0.20)", **eval_at(REVIEW_THRESHOLD)},
     {"criterion": "Youden's J (ROC 최적)", **eval_at(best_j_threshold)},
     {"criterion": "F1 최적 (PR curve)", **eval_at(best_f1_threshold)},
     {"criterion": "F2 최적 (Recall 가중, DLP 권장)", **eval_at(best_f2_threshold)},
